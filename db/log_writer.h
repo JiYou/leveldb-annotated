@@ -34,6 +34,9 @@ class Writer {
 
  private:
   WritableFile* dest_;
+  // block_offset_指一个block内的偏移值
+  // 这个偏移值只会是处于[0~32KB)之间
+  // 后面的代码在运行的时候，需要保证这一点
   int block_offset_;       // Current offset in block
 
   // crc32c values for all supported record types.  These are

@@ -273,6 +273,8 @@ static bool CanAccelerateCRC32C() {
   return port::AcceleratedCRC32C(0, kTestCRCBuffer, kBufSize) == kTestCRCValue;
 }
 
+// crc是前面字符串的crc值
+// buf/size是数据区
 uint32_t Extend(uint32_t crc, const char* buf, size_t size) {
   static bool accelerate = CanAccelerateCRC32C();
   if (accelerate) {
