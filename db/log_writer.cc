@@ -186,7 +186,7 @@ Status Writer::EmitPhysicalRecord(RecordType t, const char* ptr, size_t n) {
     // 如果写成功，立马刷写磁盘
     // 这样做会导致写一个record，刷写一次磁盘
     // 是否可以改成一个slice刷写一次磁盘?
-    if (s.ok() && t == kLastType) {
+    if (s.ok() && (t == kLastType || t == kFullType)) {
       s = dest_->Flush();
     }
   }
