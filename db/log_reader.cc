@@ -20,6 +20,7 @@ Reader::Reader(SequentialFile* file, Reporter* reporter, bool checksum,
     : file_(file),
       reporter_(reporter),
       checksum_(checksum),
+      // 一个block的memory buffer.
       backing_store_(new char[kBlockSize]),
       buffer_(),
       eof_(false),
@@ -33,15 +34,50 @@ Reader::~Reader() {
   delete[] backing_store_;
 }
 
+// Q 1. 如果initial_offset_为0，但是file给的时候，current位置不在
+//      边界上应该怎么办？
+// Q 2. initial_offset_不为0时是怎么处理的？
+// Q 3. file起始位置为0
+// Q 4. file起始位置不为0
+// 场景1： SkipToInitialBlock()中
+//   const int leftover = kBlockSize - offset_in_block;
+//   如果leftover == 6会发生什么？
+
 bool Reader::SkipToInitialBlock() {
+  // 
   const size_t offset_in_block = initial_offset_ % kBlockSize;
   uint64_t block_start_location = initial_offset_ - offset_in_block;
 
   // Don't search a block if we'd be in the trailer
+  // 如果发现文件指针落在这个7bytes的尾巴上，那么直接跳过这个block
+  // -6, -5, -4, -3, -2, -1
+  // 这里代码写成：
+  // const int leftover = kBlockSize - offset_in_block;
+  // 这里不能用<=
+  // if (leftover < kHeaderSize) {
+  //   block_start_location += kBlockSize;
+  // }
+  // 更加清晰明了
+  // 实际上，这里如果是<=应该也都是可以跳过的?
+  // leftover == 7是否需要跳过?
+  // 1. 假设取== kHeaderSize的时候被跳过了
+  //    那么万一前面一个block在写的时候，刚到余下7个btyes
+  //    这个时候会放一个kFirstType 7byte，但是没有用户数据
+  //    下一个block开始放kMiddleType
+  //    如果跳过了，那么在读下一个block的时候，开始就读到
+  //    kMiddleType, 接着会把整个用户数据跳过。
+  // 如果按照原来作者这里的思路，当leftover == 6的时候
+  // 也不跳，那么意味着会把相应的这个读出来。
+
   if (offset_in_block > kBlockSize - 6) {
     block_start_location += kBlockSize;
   }
+  // (场景1): 当发生leftover == 6时，这个时候
+  // block_start_location不会往前移动。那么后面在读的时候，仍然会从这个
+  // 需要被跳过的block开始读。
+  // offset_in_block则指向这个block的tailer部分。
 
+  // 假设有一段内存区域0是与整个文件的current_pos_是对齐的。
   end_of_buffer_offset_ = block_start_location;
 
   // Skip to start of first block that can contain the initial record
@@ -57,15 +93,19 @@ bool Reader::SkipToInitialBlock() {
 }
 
 bool Reader::ReadRecord(Slice* record, std::string* scratch) {
+  // 一开始是0，当然要跳过了
   if (last_record_offset_ < initial_offset_) {
     if (!SkipToInitialBlock()) {
       return false;
     }
   }
 
+  // 用户传进来的内存区域
   scratch->clear();
   record->clear();
+  // 是否在一个切片的record里面
   bool in_fragmented_record = false;
+  // 逻辑record上的offset.
   // Record offset of the logical record that we're reading
   // 0 is a dummy value to make compilers happy
   uint64_t prospective_record_offset = 0;
@@ -193,12 +233,23 @@ void Reader::ReportDrop(uint64_t bytes, const Status& reason) {
 
 unsigned int Reader::ReadPhysicalRecord(Slice* result) {
   while (true) {
+    // buffer_虽然是由backing_store_构成，但是并不意味着
+    // buffer_的大小一直是kBlockSize
+    // 当从缓冲区中取走一部分数据之后，slice/buffer_内部的指针就
+    // 会前移，然后buffer_的size就会变化了
+    // (场景1): 这里会读取一个block出来
+    //         一开始buffer_.size() == 0
     if (buffer_.size() < kHeaderSize) {
       if (!eof_) {
         // Last read was a full read, so this is a trailer to skip
         buffer_.clear();
+        // Read会把读取的数据存放到backing_store_
+        // 然后利用backing_store_构建出
+        // buffer_ = Slice(backing_store_, n);
+        // n是最终读出来的数据大小
         Status status = file_->Read(kBlockSize, &buffer_, backing_store_);
         end_of_buffer_offset_ += buffer_.size();
+        // 这里是读取文件发生错误!
         if (!status.ok()) {
           buffer_.clear();
           ReportDrop(kBlockSize, status);
@@ -207,6 +258,7 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result) {
         } else if (buffer_.size() < kBlockSize) {
           eof_ = true;
         }
+        // 读完一个block之后，继续
         continue;
       } else {
         // Note that if buffer_ is non-empty, we have a truncated header at the
@@ -224,6 +276,11 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result) {
     const uint32_t b = static_cast<uint32_t>(header[5]) & 0xff;
     const unsigned int type = header[6];
     const uint32_t length = a | (b << 8);
+
+    // 这里是说，一个record里面出来的
+    // const int record_size = kHeaderSize + length
+    // if (record_size > buffer_.size())
+    // 肯定出错了
     if (kHeaderSize + length > buffer_.size()) {
       size_t drop_size = buffer_.size();
       buffer_.clear();
@@ -237,6 +294,7 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result) {
       return kEof;
     }
 
+    // 如果读出来的类型是kZeroType
     if (type == kZeroType && length == 0) {
       // Skip zero length record without reporting any drops since
       // such records are produced by the mmap based writing code in
