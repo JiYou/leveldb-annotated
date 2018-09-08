@@ -9,6 +9,17 @@
 #include "util/coding.h"
 #include "util/crc32c.h"
 
+/*
+ * 总结一下写流程：
+ * 1. 类初始化时生成各种kXXXType的crc值，方便以后直接使用，而不是反复地计算
+ * 写入:
+ * a. 查看是不是在尾部，即如果尾部的数据不足kHeaderSize，那么用\x00来填充
+ * b.1 如果余下的空间 == kHeaderSize，那么用一个不带任何数据的header填充
+ * b.2 每次写入的时候，是在block内余下空间avail，和还没有写完的数据left
+ *     这两者之间取最小值
+ * c. 刷写到磁盘中
+ *    1. 原来的刷写是每个record flush一次
+ */
 namespace leveldb {
 namespace log {
 

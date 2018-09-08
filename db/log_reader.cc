@@ -9,6 +9,19 @@
 #include "util/coding.h"
 #include "util/crc32c.h"
 
+/*
+ * 总结一下读者的行为
+ * 1. 跳过initial_offset_的block
+ * 2. 跳过initial_offset_的record
+ * 读record的步骤
+ * a. 先把数据读到backing_store_里面
+ * b. 利用backing_store_构建buffer_
+ *    取record时候从buffer_中取
+ *    end_of_buffer_offset_ - buffer_.size() - kHeaderSize - x
+ *    是拿到刚读取的，长度为x的record的物理起始位置
+ * c. {kFirstType, kMiddleType, kLastType}/kFullType需要拼接好了才返回
+ *    给scratch.
+ */
 namespace leveldb {
 namespace log {
 
@@ -36,9 +49,10 @@ Reader::~Reader() {
 
 // Q 1. 如果initial_offset_为0，但是file给的时候，current位置不在
 //      边界上应该怎么办？
+//   应该是要求必须要求current pos在32KB上已经是对齐的。否则后面根据
+//      initial_offset_来跳跃就没有意义。
 // Q 2. initial_offset_不为0时是怎么处理的？
-// Q 3. file起始位置为0
-// Q 4. file起始位置不为0
+//
 // 场景1： SkipToInitialBlock()中
 //   const int leftover = kBlockSize - offset_in_block;
 //   如果leftover == 6会发生什么？
@@ -108,6 +122,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
   // 逻辑record上的offset.
   // Record offset of the logical record that we're reading
   // 0 is a dummy value to make compilers happy
+  // 临时记录下kFullType或者kFirstType类型的record 的起始位置.
   uint64_t prospective_record_offset = 0;
 
   Slice fragment;
@@ -117,6 +132,12 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
     // ReadPhysicalRecord may have only had an empty trailer remaining in its
     // internal buffer. Calculate the offset of the next physical record now
     // that it has returned, properly accounting for its header size.
+    // 这里拿到的实际上是刚读出来的record的起始位置.
+    // buffer_.size()是一个block里面还没有读出来的部分
+    // kHeaderSize指的是刚读出来的slice的header头的大小
+    // fragment是读出来的数据部分的长度
+    // a. end_of_buffer_offset 指向的是buffer_尾部物理上的偏移
+    // 注意，这里记录的是一个record的开头位置
     uint64_t physical_record_offset =
         end_of_buffer_offset_ - buffer_.size() - kHeaderSize - fragment.size();
 
@@ -145,6 +166,8 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
         prospective_record_offset = physical_record_offset;
         scratch->clear();
         *record = fragment;
+        // 所以last_record_offset_指向的就是一个record的开头位置
+        // 也就是刚读出来的record的开头位置
         last_record_offset_ = prospective_record_offset;
         return true;
 
@@ -322,12 +345,17 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result) {
     buffer_.remove_prefix(kHeaderSize + length);
 
     // Skip physical record that started before initial_offset_
+    // end_of_buffer_offset_ - buffer_.size() - kHeaderSize - length
+    // 得到的就是一个record的开头位置。
+    // 如果这个record的起始位置小于initial_offset_
+    // 那么直接跳过
     if (end_of_buffer_offset_ - buffer_.size() - kHeaderSize - length <
         initial_offset_) {
       result->clear();
       return kBadRecord;
     }
 
+    // 一个正常的record被读出来
     *result = Slice(header + kHeaderSize, length);
     return type;
   }

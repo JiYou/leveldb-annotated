@@ -22,7 +22,7 @@ class Reader {
   // Interface for reporting errors.
   class Reporter {
    public:
-   // 这个只是用来汇错误的，在阅读代码的时候可以跳过
+   // 这个只是用来汇报错误的，在阅读代码的时候可以跳过
     virtual ~Reporter();
 
     // Some corruption was detected.  "size" is the approximate number
@@ -71,9 +71,14 @@ class Reader {
   bool const checksum_;
 
   // backing_store_一个Block大小的内存区域
+  // 一个backing_store_就是一个block
   char* const backing_store_;
   // buffer实际上就是backing_store_的皮
   // buffer_内部的data_指针就是指向backing_store_的。
+  // buffer_会随着record的读取而移动
+  // 所以buffer_里面记录的是一个block里面未读完的部分
+  // end_of_buffer_offset_与buffer_是有联系的，注意看
+  // end_of_buffer_offset_的说明
   Slice buffer_;
 
   // 是否遇到EOF?
@@ -81,10 +86,21 @@ class Reader {
 
   // 最后一次record读取成功后的offset位置
   // 只有读完kLastType或者kFullType之后才会更新这个值
+  // 注意，指向的是物理上offset_
+  // 并且是record的开头部分。
   // Offset of the last record returned by ReadRecord.
+  // 准确的讲，这个不应该叫last_record
+  // 因为一个很长的slice也有可能被切分成多个record，但是这里并不记录
+  // 中间那些不完整的record.比如kMiddleType的offset.
+  //
+  // 这里准确的意义应该说的是用户传给log_writer写入的时候，用户data
+  // 的开头部分。
+  // 因为后面的代码，只在kFullType和kFirstType的时候才会记录这个值
   uint64_t last_record_offset_;
 
   // buffer_里面的offset
+  // 注意end_of_所以，end_of_buffer_offset_指向的是
+  // 物理位置上的buffer_对应的block的尾部。
   // Offset of the first location past the end of buffer_.
   uint64_t end_of_buffer_offset_;
 
