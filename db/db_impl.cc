@@ -89,27 +89,53 @@ static void ClipToRange(T* ptr, V minvalue, V maxvalue) {
   if (static_cast<V>(*ptr) > maxvalue) *ptr = maxvalue;
   if (static_cast<V>(*ptr) < minvalue) *ptr = minvalue;
 }
+
+/*
+ * 修改option里面的各种设定：
+ * 1. 修改参数范围
+ * 2. 设置info_log
+ * 3. 设置block_cache
+ */
 Options SanitizeOptions(const std::string& dbname,
                         const InternalKeyComparator* icmp,
                         const InternalFilterPolicy* ipolicy,
                         const Options& src) {
+  // 基于传进来的option
   Options result = src;
+  // 设置key比较器
   result.comparator = icmp;
+  // 过滤器, 先不管这个用来做什么
   result.filter_policy = (src.filter_policy != nullptr) ? ipolicy : nullptr;
+  // 这里是把参数归一化，过大的数放到max_value
+  // 太小的数放到min_value
+  // 介于最大和最小之间的不做处理
   ClipToRange(&result.max_open_files,    64 + kNumNonTableCacheFiles, 50000);
   ClipToRange(&result.write_buffer_size, 64<<10,                      1<<30);
   ClipToRange(&result.max_file_size,     1<<20,                       1<<30);
   ClipToRange(&result.block_size,        1<<10,                       4<<20);
+  // 中间操作记录，出错信息等等
+  // 会把中间步骤与信息都写到这个文件里面
+  // 这个文件放置的位置是dbname/info_log
   if (result.info_log == nullptr) {
+    // 如果还没有日志指针，那么创建相应的目录
     // Open a log file in the same directory as the db
     src.env->CreateDir(dbname);  // In case it does not exist
+    // 把原来的LOG文件重命名
     src.env->RenameFile(InfoLogFileName(dbname), OldInfoLogFileName(dbname));
+    // 生成新的LOG文件
     Status s = src.env->NewLogger(InfoLogFileName(dbname), &result.info_log);
+    // 如果不成功
     if (!s.ok()) {
       // No place suitable for logging
+      // 那么依旧使用nullptr.
       result.info_log = nullptr;
     }
   }
+  // 如果没有block_cache
+  // block_cache就是用来存放sst文件里面的block数据部分
+  // table_cache是用来存放sst文件里面的index cache部分
+  // 这里并没有设置table_cache，后面可以看一下
+  // table_cache是在哪里处理的。
   if (result.block_cache == nullptr) {
     result.block_cache = NewLRUCache(8 << 20);
   }
@@ -122,7 +148,10 @@ static int TableCacheSize(const Options& sanitized_options) {
 }
 
 DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
-    : env_(raw_options.env),
+    :
+      // 初始化env环境变量
+      env_(raw_options.env),
+      // 初始化
       internal_comparator_(raw_options.comparator),
       internal_filter_policy_(raw_options.filter_policy),
       options_(SanitizeOptions(dbname, &internal_comparator_,
@@ -1499,6 +1528,7 @@ DB::~DB() { }
 
 Status DB::Open(const Options& options, const std::string& dbname,
                 DB** dbptr) {
+  // db指针，一开始设置为空
   *dbptr = nullptr;
 
   DBImpl* impl = new DBImpl(options, dbname);
