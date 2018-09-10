@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <iostream>
 #include "db/log_reader.h"
 
 #include <stdio.h>
@@ -13,6 +14,10 @@
  * 总结一下读者的行为
  * 1. 跳过initial_offset_的block
  * 2. 跳过initial_offset_的record
+ * 3. 然后一个一个record读出来。如果是{kFirstType, kMiddleType, kLastType}
+ *    就把record都读出来，然后组装到scratch里面
+ *    如果是kFullType，那么就只把结果放到record参数中，而不放到scratch中
+ * 
  * 读record的步骤
  * a. 先把数据读到backing_store_里面
  * b. 利用backing_store_构建buffer_
@@ -66,11 +71,11 @@ bool Reader::SkipToInitialBlock() {
   // 如果发现文件指针落在这个7bytes的尾巴上，那么直接跳过这个block
   // -6, -5, -4, -3, -2, -1
   // 这里代码写成：
-  // const int leftover = kBlockSize - offset_in_block;
+  const int leftover = kBlockSize - offset_in_block;
   // 这里不能用<=
-  // if (leftover < kHeaderSize) {
-  //   block_start_location += kBlockSize;
-  // }
+  if (leftover < kHeaderSize) {
+    block_start_location += kBlockSize;
+  }
   // 更加清晰明了
   // 实际上，这里如果是<=应该也都是可以跳过的?
   // leftover == 7是否需要跳过?
@@ -83,9 +88,13 @@ bool Reader::SkipToInitialBlock() {
   // 如果按照原来作者这里的思路，当leftover == 6的时候
   // 也不跳，那么意味着会把相应的这个读出来。
 
-  if (offset_in_block > kBlockSize - 6) {
-    block_start_location += kBlockSize;
-  }
+  //if (offset_in_block > kBlockSize - 6) {
+  //  block_start_location += kBlockSize;
+  //}
+
+  std::cout << "block_start_location = " << block_start_location << std::endl;
+  std::cout << "initial_offset_ = " << initial_offset_ << std::endl;
+
   // (场景1): 当发生leftover == 6时，这个时候
   // block_start_location不会往前移动。那么后面在读的时候，仍然会从这个
   // 需要被跳过的block开始读。
@@ -123,12 +132,13 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
   // Record offset of the logical record that we're reading
   // 0 is a dummy value to make compilers happy
   // 临时记录下kFullType或者kFirstType类型的record 的起始位置.
-  uint64_t prospective_record_offset = 0;
+  uint64_t k_first_record_offset = 0;
 
   Slice fragment;
   while (true) {
     const unsigned int record_type = ReadPhysicalRecord(&fragment);
-
+    std::cout << "--------BEGIN--------" << std::endl;
+    std::cout << "record_type = " << record_type  << " kBadType = " << kBadRecord << std::endl;
     // ReadPhysicalRecord may have only had an empty trailer remaining in its
     // internal buffer. Calculate the offset of the next physical record now
     // that it has returned, properly accounting for its header size.
@@ -140,20 +150,35 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
     // 注意，这里记录的是一个record的开头位置
     uint64_t physical_record_offset =
         end_of_buffer_offset_ - buffer_.size() - kHeaderSize - fragment.size();
+    // 注意: 如果record_type == kBadRecord
+    // 那么fragment.size() == 0
+    // 实际上就是physical_record_offset自动跳过了这个bad record.
 
+    // fragment.size() == 0
+    std::cout << "end_of_buffer_offset_ = " << end_of_buffer_offset_ << " - "
+              << "buffer_.size() = " << buffer_.size() << " - "
+              << "kHeaderSize = " << kHeaderSize << " - "
+              << "fragment.size() = " << fragment.size() << std::endl;
+    std::cout << "physical_record_offset = " << physical_record_offset << std::endl;
+
+    std::cout << "resyncing_ = " << resyncing_ << std::endl;
     if (resyncing_) {
       if (record_type == kMiddleType) {
+        std::cout << "record_type == kMiddleType; continue" << std::endl;
         continue;
       } else if (record_type == kLastType) {
+        std::cout << "record_type == kLastType; resyncing = false; continue" << std::endl;
         resyncing_ = false;
         continue;
       } else {
         resyncing_ = false;
+        std::cout << "else: resyncing_ = " << resyncing_ << std::endl;
       }
     }
 
     switch (record_type) {
       case kFullType:
+        std::cout << "case kFullType:" << std::endl;
         if (in_fragmented_record) {
           // Handle bug in earlier versions of log::Writer where
           // it could emit an empty kFirstType record at the tail end
@@ -163,15 +188,15 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
             ReportCorruption(scratch->size(), "partial record without end(1)");
           }
         }
-        prospective_record_offset = physical_record_offset;
         scratch->clear();
         *record = fragment;
         // 所以last_record_offset_指向的就是一个record的开头位置
         // 也就是刚读出来的record的开头位置
-        last_record_offset_ = prospective_record_offset;
+        last_record_offset_ = physical_record_offset;
         return true;
 
       case kFirstType:
+        std::cout << "case kFirstType:" << std::endl;
         if (in_fragmented_record) {
           // Handle bug in earlier versions of log::Writer where
           // it could emit an empty kFirstType record at the tail end
@@ -181,12 +206,13 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
             ReportCorruption(scratch->size(), "partial record without end(2)");
           }
         }
-        prospective_record_offset = physical_record_offset;
+        k_first_record_offset = physical_record_offset;
         scratch->assign(fragment.data(), fragment.size());
         in_fragmented_record = true;
         break;
 
       case kMiddleType:
+        std::cout << "case kMiddleType:" << std::endl;
         if (!in_fragmented_record) {
           ReportCorruption(fragment.size(),
                            "missing start of fragmented record(1)");
@@ -196,18 +222,21 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
         break;
 
       case kLastType:
+        std::cout << "case kLastType:" << std::endl;
         if (!in_fragmented_record) {
+          std::cout << "ReportCorruption .... continue" << std::endl;
           ReportCorruption(fragment.size(),
                            "missing start of fragmented record(2)");
         } else {
           scratch->append(fragment.data(), fragment.size());
           *record = Slice(*scratch);
-          last_record_offset_ = prospective_record_offset;
+          last_record_offset_ = k_first_record_offset;
           return true;
         }
         break;
 
       case kEof:
+        std::cout << "case kEof:" << std::endl;
         if (in_fragmented_record) {
           // This can be caused by the writer dying immediately after
           // writing a physical record but before completing the next; don't
@@ -217,6 +246,8 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
         return false;
 
       case kBadRecord:
+        std::cout << "case kBadRecord:" << std::endl;
+        // 注意kBadRecord会继续读
         if (in_fragmented_record) {
           ReportCorruption(scratch->size(), "error in middle of record");
           in_fragmented_record = false;
@@ -225,6 +256,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
         break;
 
       default: {
+        std::cout << "case default:" << std::endl;
         char buf[40];
         snprintf(buf, sizeof(buf), "unknown record type %u", record_type);
         ReportCorruption(
@@ -263,6 +295,8 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result) {
     // (场景1): 这里会读取一个block出来
     //         一开始buffer_.size() == 0
     if (buffer_.size() < kHeaderSize) {
+      // 如果还没有遇到尾吧，但是余下的空间是少于kHeaderSize的
+      // 那么这里就需要重新取出block size.
       if (!eof_) {
         // Last read was a full read, so this is a trailer to skip
         buffer_.clear();
