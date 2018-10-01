@@ -36,6 +36,9 @@ class Version;
 class VersionSet;
 class WritableFile;
 
+// 返回一个最小的index索引，使得files[i]->largest >= key
+// 也就是刚好比key大，那么这个应该是lower_bound还是upper_bound?
+// 由于是第一个index,所以应该是lower_bound
 // Return the smallest index i such that files[i]->largest >= key.
 // Return files.size() if there is no such file.
 // REQUIRES: "files" contains a sorted list of non-overlapping files.
@@ -43,6 +46,11 @@ int FindFile(const InternalKeyComparator& icmp,
              const std::vector<FileMetaData*>& files,
              const Slice& key);
 
+// 参数有三个：
+// user给定一个区间[smallest, largest]
+// 然后再给定一堆文件files,
+// 再加上一个说明：files里面的文件是否相互之间有overlap?
+// 返回值说明：给定的区间是否和files这个有交集。
 // Returns true iff some file in "files" overlaps the user key range
 // [*smallest,*largest].
 // smallest==nullptr represents a key smaller than all keys in the DB.

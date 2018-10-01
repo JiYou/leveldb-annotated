@@ -121,6 +121,7 @@ Options SanitizeOptions(const std::string& dbname,
     // Open a log file in the same directory as the db
     src.env->CreateDir(dbname);  // In case it does not exist
     // 把原来的LOG文件重命名
+    // ${dbname}/LOG -> ${dbname}/LOG.old
     src.env->RenameFile(InfoLogFileName(dbname), OldInfoLogFileName(dbname));
     // 生成新的LOG文件
     Status s = src.env->NewLogger(InfoLogFileName(dbname), &result.info_log);
@@ -151,29 +152,50 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
     :
       // 初始化env环境变量
       env_(raw_options.env),
-      // 初始化
+      // 初始化key比较器
       internal_comparator_(raw_options.comparator),
+      // 初始化过滤策略
       internal_filter_policy_(raw_options.filter_policy),
+      // 设置option:1. 参数. 2. info_log 3. block_cache
       options_(SanitizeOptions(dbname, &internal_comparator_,
                                &internal_filter_policy_, raw_options)),
+      // 是否有info_log_
       owns_info_log_(options_.info_log != raw_options.info_log),
+      // 是否有option中的cache.
       owns_cache_(options_.block_cache != raw_options.block_cache),
+      // 数据库的名字
       dbname_(dbname),
+      // table_cache指的是sst文件的index部分的cache
       table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
+      // 数据库的锁
       db_lock_(nullptr),
+      // 是否关闭: Q: 这里为什么用指针？而不是用bool变量
+      // 应该是考虑到原子性，如果这里是用cpp11，那么就应该用atomic<bool>
       shutting_down_(nullptr),
+      // 后台线程信号
       background_work_finished_signal_(&mutex_),
+      // 活跃的mem
       mem_(nullptr),
+      // 不能修改的mem
       imm_(nullptr),
+      // WAL journal文件句柄，类似于FILE指针
       logfile_(nullptr),
+      // WAL文件序号
       logfile_number_(0),
+      // WAL文件写者
       log_(nullptr),
+      // 随机数种子
       seed_(0),
+      // 临时批量写
       tmp_batch_(new WriteBatch),
+      // 后台合并调度
       background_compaction_scheduled_(false),
+      // 手动合并
       manual_compaction_(nullptr),
+      // 生成一个空的版本set对象
       versions_(new VersionSet(dbname_, &options_, table_cache_,
                                &internal_comparator_)) {
+  // 设置has_imm_为nullptr.
   has_imm_.Release_Store(nullptr);
 }
 
@@ -181,6 +203,7 @@ DBImpl::~DBImpl() {
   // Wait for background work to finish
   mutex_.Lock();
   shutting_down_.Release_Store(this);  // Any non-null value is ok
+  // 在退出的时候，要等后台的程序运行完成
   while (background_compaction_scheduled_) {
     background_work_finished_signal_.Wait();
   }
@@ -205,20 +228,43 @@ DBImpl::~DBImpl() {
     delete options_.block_cache;
   }
 }
-
+/*
+ * 总结一下NewDB()
+ * 1. 初始化各种序列号
+ *    0给WAL日志
+ *    1给manifest文件
+ *    2给将来要生成的新的文件编号
+ * 2. 利用WAL日志文件将new_db这个版本编辑器dump到版本
+ *    WAL日志manifest文件中
+ * 3. 检查是否写入成功，如果写入成功，那么更新CURRENT文件
+ *    如果失败，那么删除manifest文件
+ */
 Status DBImpl::NewDB() {
+  // 生成一个空的版本编辑器
   VersionEdit new_db;
+  // 设置DB name
   new_db.SetComparatorName(user_comparator()->Name());
+  // 设置WAL编号: 也就是说WAL log把编号0占用了
   new_db.SetLogNumber(0);
+  // 设置接下来的文件编号
+  // 接下来新的文件会使用编号2
+  // 那么中间的1呢？下面可以看到1是被Manifest文件看到了。
   new_db.SetNextFile(2);
+  // 用户提交key/value时的编号
   new_db.SetLastSequence(0);
-
+  // manifest文件的编号，这里新生成的DB里面把1占用掉了。
   const std::string manifest = DescriptorFileName(dbname_, 1);
+
+  // 接下来把这个生成新DB的操作通过写WAL日志的方式
+  // 写到manifest文件中
   WritableFile* file;
+  // manifest文件也是一个WAL文件
+  // 这里是生成相应的文件句柄
   Status s = env_->NewWritableFile(manifest, &file);
   if (!s.ok()) {
     return s;
   }
+  // 把生成DB的操作写入到manifest文件中
   {
     log::Writer log(file);
     std::string record;
@@ -228,11 +274,14 @@ Status DBImpl::NewDB() {
       s = file->Close();
     }
   }
+  // 写入完成之后一，释放资源
   delete file;
   if (s.ok()) {
+    // 如果写入成功，那么将CURRENT文件指向当前的新的manifest文件
     // Make "CURRENT" file that points to the new manifest file.
     s = SetCurrentFile(env_, dbname_, 1);
   } else {
+    // 如果失败，那么就取消这个记录
     env_->DeleteFile(manifest);
   }
   return s;
@@ -250,6 +299,8 @@ void DBImpl::MaybeIgnoreError(Status* s) const {
 void DBImpl::DeleteObsoleteFiles() {
   mutex_.AssertHeld();
 
+  // 如果后台发生了错误，并不清楚一个新的版本是否或者没有被提交，所以这里为了
+  // 安全起见，并不会去做垃圾收集
   if (!bg_error_.ok()) {
     // After a background error, we don't know whether a new version may
     // or may not have been committed, so we cannot safely garbage collect.
@@ -257,34 +308,51 @@ void DBImpl::DeleteObsoleteFiles() {
   }
 
   // Make a set of all of the live files
+  // 把所有等着输出的文件放到live中去
   std::set<uint64_t> live = pending_outputs_;
   versions_->AddLiveFiles(&live);
 
+  // 拿出所有db/目录里面的文件
   std::vector<std::string> filenames;
   env_->GetChildren(dbname_, &filenames);  // Ignoring errors on purpose
+  // 序号
   uint64_t number;
+  // 类型
   FileType type;
+  // 遍历所有的文件 
   for (size_t i = 0; i < filenames.size(); i++) {
+    // 取出文件的序号，类型
     if (ParseFileName(filenames[i], &number, &type)) {
+      // 默认是保留这个文件
       bool keep = true;
       switch (type) {
+        // WAL日志文件只保留两个：
+        // current log number
+        // pre log number
         case kLogFile:
           keep = ((number >= versions_->LogNumber()) ||
                   (number == versions_->PrevLogNumber()));
           break;
+        // MANIFEST文件的WAL日志文件
         case kDescriptorFile:
           // Keep my manifest file, and any newer incarnations'
           // (in case there is a race that allows other incarnations)
+          // 只保留当前的版本
+          // Q: 不存snapshot么？
           keep = (number >= versions_->ManifestFileNumber());
           break;
         case kTableFile:
+          // 如果是sst文件，那么如果不在live里面，就要干掉
           keep = (live.find(number) != live.end());
           break;
         case kTempFile:
+          // 临时文件必须被输出到pending_outputs_里面
+          // 否则就删除
           // Any temp files that are currently being written to must
           // be recorded in pending_outputs_, which is inserted into "live"
           keep = (live.find(number) != live.end());
           break;
+        // 其他CURRENT/lock/LOG文件，都保留
         case kCurrentFile:
         case kDBLockFile:
         case kInfoLogFile:
@@ -293,9 +361,12 @@ void DBImpl::DeleteObsoleteFiles() {
       }
 
       if (!keep) {
+        // 如果不保留
+        // 那么从TableCache中移除
         if (type == kTableFile) {
           table_cache_->Evict(number);
         }
+        // 真正删除文件
         Log(options_.info_log, "Delete type=%d #%lld\n",
             static_cast<int>(type),
             static_cast<unsigned long long>(number));
@@ -311,15 +382,23 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest) {
   // Ignore error from CreateDir since the creation of the DB is
   // committed only when the descriptor is created, and this directory
   // may already exist from a previous failed creation attempt.
+  // 创建目录
   env_->CreateDir(dbname_);
   assert(db_lock_ == nullptr);
+  // 创建文件锁
   Status s = env_->LockFile(LockFileName(dbname_), &db_lock_);
   if (!s.ok()) {
     return s;
   }
-
+  // 如果current文件不存在
   if (!env_->FileExists(CurrentFileName(dbname_))) {
     if (options_.create_if_missing) {
+      // 通过CURRENT文件和create_if_missing
+      // 这两个条件来决定是否需要生成数据库
+      // NewDB并不是仅生成一个数据库内存对象
+      // 主要功能还是生成一个VersionEdit
+      // 然后将这个“生成新DB"的操作持久化到
+      // manifest文件中
       s = NewDB();
       if (!s.ok()) {
         return s;
@@ -334,7 +413,8 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest) {
           dbname_, "exists (error_if_exists is true)");
     }
   }
-
+  // 这里会从manifest里面将各种VersionEdit读出来
+  // 然后apply到current_ version上
   s = versions_->Recover(save_manifest);
   if (!s.ok()) {
     return s;
@@ -348,25 +428,42 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest) {
   // Note that PrevLogNumber() is no longer used, but we pay
   // attention to it in case we are recovering a database
   // produced by an older version of leveldb.
+  // 取出version_set里面的log_number
+  // 取出之前的log number.
   const uint64_t min_log = versions_->LogNumber();
   const uint64_t prev_log = versions_->PrevLogNumber();
+  // 扫描目录下的所有的文件
   std::vector<std::string> filenames;
   s = env_->GetChildren(dbname_, &filenames);
   if (!s.ok()) {
     return s;
   }
+
+  // live文件集合为空
+  // 这里并不是说把expected里面的内容放到live里面去
+  // 而是扫描整个version_set里面所有的version
+  // 所有level文件，都会被加到expected里面。
   std::set<uint64_t> expected;
   versions_->AddLiveFiles(&expected);
+
   uint64_t number;
   FileType type;
   std::vector<uint64_t> logs;
+  // filenames是一个db目录下的所有的文件
   for (size_t i = 0; i < filenames.size(); i++) {
+    // 能够正确解析的文件形成的集合，总是会包含expected
     if (ParseFileName(filenames[i], &number, &type)) {
+      // 最后expected必然要为空才行
+      // 不能说version_set里面有很多文件，但是这些文件又不存在于磁盘上
       expected.erase(number);
+      // 取出有效的log文件
       if (type == kLogFile && ((number >= min_log) || (number == prev_log)))
         logs.push_back(number);
     }
   }
+  // 磁盘上可以解析的文件
+  // 肯定是expected的父集
+  // 所以一阵处理之后，expected肯定为空
   if (!expected.empty()) {
     char buf[50];
     snprintf(buf, sizeof(buf), "%d missing files; e.g.",
@@ -374,6 +471,8 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest) {
     return Status::Corruption(buf, TableFileName(dbname_, *(expected.begin())));
   }
 
+  // 将logs文件排序
+  // 然后依次重放log文件
   // Recover in the order in which the logs were generated
   std::sort(logs.begin(), logs.end());
   for (size_t i = 0; i < logs.size(); i++) {

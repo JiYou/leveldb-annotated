@@ -23,9 +23,12 @@ class Version;
 class VersionEdit;
 class VersionSet;
 
+// DB是数据库的接口
+// DBImpl是实现
 class DBImpl : public DB {
  public:
   DBImpl(const Options& options, const std::string& dbname);
+  // 注意写成虚析构
   virtual ~DBImpl();
 
   // Implementations of the DB interface
@@ -132,31 +135,47 @@ class DBImpl : public DB {
   TableCache* const table_cache_;
 
   // Lock over the persistent DB state.  Non-null iff successfully acquired.
+  // 文件锁,后面注意文件锁的实现
   FileLock* db_lock_;
 
   // State below is protected by mutex_
+  // 下面所有的变量都会被mutex_保护
   port::Mutex mutex_;
+  // 这里使用原子指针，如果是cpp11应该是可以直接使用atomic变量
   port::AtomicPointer shutting_down_;
+  // 条件变量
   port::CondVar background_work_finished_signal_ GUARDED_BY(mutex_);
+  // 活跃skiplist_;
   MemTable* mem_;
+  // 不能修改，只能是只读的skiplist_
   MemTable* imm_ GUARDED_BY(mutex_);  // Memtable being compacted
+  // 是否有imm_，也就是说是否生成了imm_
   port::AtomicPointer has_imm_;       // So bg thread can detect non-null imm_
+  // WAL文件写对象，相当于C语言里面的FILE对象
   WritableFile* logfile_;
+  // WAL文件序号
   uint64_t logfile_number_ GUARDED_BY(mutex_);
+  // log_是WAL写者
   log::Writer* log_;
   uint32_t seed_ GUARDED_BY(mutex_);  // For sampling.
 
   // Queue of writers.
+  // 所以进来的key/value放到DB的时候，都会被放到一个写者队列中
+  // writers_就是这个写者队列
   std::deque<Writer*> writers_ GUARDED_BY(mutex_);
+  // 临时的批量写
   WriteBatch* tmp_batch_ GUARDED_BY(mutex_);
 
+  // 快照list
   SnapshotList snapshots_ GUARDED_BY(mutex_);
 
   // Set of table files to protect from deletion because they are
   // part of ongoing compactions.
+  // 一些受保护的文件，防止被删除掉，这是因为这些文件可能正在进行合并
   std::set<uint64_t> pending_outputs_ GUARDED_BY(mutex_);
 
   // Has a background compaction been scheduled or is running?
+  // 后台的合并是否被调度了或者是否正在运行。
   bool background_compaction_scheduled_ GUARDED_BY(mutex_);
 
   // Information for a manual compaction
@@ -168,7 +187,8 @@ class DBImpl : public DB {
     InternalKey tmp_storage;    // Used to keep track of compaction progress
   };
   ManualCompaction* manual_compaction_ GUARDED_BY(mutex_);
-
+  // 当前这个leveldb组成的版本库
+  // 每次合并都会生成一个新的版本
   VersionSet* const versions_;
 
   // Have we encountered a background error in paranoid mode?

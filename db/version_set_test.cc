@@ -57,6 +57,8 @@ TEST(FindFileTest, Empty) {
 }
 
 TEST(FindFileTest, Single) {
+  // 这里是生成一个文件，这个文件里面包含的
+  // key是从p~q
   Add("p", "q");
   ASSERT_EQ(0, Find("a"));
   ASSERT_EQ(0, Find("p"));

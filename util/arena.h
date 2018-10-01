@@ -19,9 +19,11 @@ class Arena {
   ~Arena();
 
   // Return a pointer to a newly allocated memory block of "bytes" bytes.
+  // 跟malloc一样的效果
   char* Allocate(size_t bytes);
 
   // Allocate memory with the normal alignment guarantees provided by malloc
+  // 分配对齐的内存
   char* AllocateAligned(size_t bytes);
 
   // Returns an estimate of the total memory usage of data allocated

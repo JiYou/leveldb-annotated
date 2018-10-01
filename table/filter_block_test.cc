@@ -11,6 +11,8 @@
 #include "util/testharness.h"
 #include "util/testutil.h"
 
+// 主要是用来测试filter block
+
 namespace leveldb {
 
 // For testing: emit an array with one hash value per key

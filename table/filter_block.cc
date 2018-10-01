@@ -82,9 +82,12 @@ FilterBlockReader::FilterBlockReader(const FilterPolicy* policy,
       offset_(nullptr),
       num_(0),
       base_lg_(0) {
+  // 注意这里的contents只是用于filter block的内容。
+  // 并不包含其他block的内容。
   size_t n = contents.size();
   if (n < 5) return;  // 1 byte for base_lg_ and 4 for start of offset array
   base_lg_ = contents[n-1];
+  // 这里实际上取出了filter的offset
   uint32_t last_word = DecodeFixed32(contents.data() + n - 5);
   if (last_word > n - 5) return;
   data_ = contents.data();
@@ -95,16 +98,24 @@ FilterBlockReader::FilterBlockReader(const FilterPolicy* policy,
 bool FilterBlockReader::KeyMayMatch(uint64_t block_offset, const Slice& key) {
   uint64_t index = block_offset >> base_lg_;
   if (index < num_) {
+    // 如果是合法的
     uint32_t start = DecodeFixed32(offset_ + index*4);
+    // 当前这个filter的limit肯定是下一个filter的开头位置
     uint32_t limit = DecodeFixed32(offset_ + index*4 + 4);
+    // 必须要保证limit也是合法的
     if (start <= limit && limit <= static_cast<size_t>(offset_ - data_)) {
+      // 在合法的情况下，取出filter
       Slice filter = Slice(data_ + start, limit - start);
+      // Slice filter实际上可以看成是数据的输入部分
       return policy_->KeyMayMatch(key, filter);
     } else if (start == limit) {
+      // 如果这个filter是空的，那么直接返回不存在
+      // 多半的原因是这段内存里面没有key
       // Empty filters do not match any keys
       return false;
     }
   }
+  // 出错的时候，返回有可能存在
   return true;  // Errors are treated as potential matches
 }
 

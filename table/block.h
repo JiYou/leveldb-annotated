@@ -36,6 +36,7 @@ class Block {
   Block(const Block&);
   void operator=(const Block&);
 
+  // 主要的接口都在这个Iter里面
   class Iter;
 };
 

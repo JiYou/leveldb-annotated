@@ -26,6 +26,7 @@ class FilterPolicy;
 //
 // The sequence of calls to FilterBlockBuilder must match the regexp:
 //      (StartBlock AddKey*)* Finish
+// 与BlockBuilder一样，都是Finish之后，就不能再修改了
 class FilterBlockBuilder {
  public:
   explicit FilterBlockBuilder(const FilterPolicy*);
@@ -49,6 +50,8 @@ class FilterBlockBuilder {
   void operator=(const FilterBlockBuilder&);
 };
 
+// 虽然是Reader，但实际上是一个filter
+// 就是用来进行过滤的
 class FilterBlockReader {
  public:
  // REQUIRES: "contents" and *policy must stay live while *this is live.

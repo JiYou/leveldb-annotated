@@ -79,11 +79,15 @@ Status TableCache::FindTable(uint64_t file_number, uint64_t file_size,
   return s;
 }
 
+// 通过file_number, file_size找到相应的TableObject
+// 如果tableptr不为空，那么就指向TableObject
 Iterator* TableCache::NewIterator(const ReadOptions& options,
                                   uint64_t file_number,
                                   uint64_t file_size,
                                   Table** tableptr) {
+  // 如果不为空，那么去掉原有的值
   if (tableptr != nullptr) {
+    // 置空
     *tableptr = nullptr;
   }
 

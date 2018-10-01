@@ -4,6 +4,7 @@
 
 #include "db/version_set.h"
 
+#include <iostream>
 #include <algorithm>
 #include <stdio.h>
 #include "db/filename.h"
@@ -17,6 +18,7 @@
 #include "table/two_level_iterator.h"
 #include "util/coding.h"
 #include "util/logging.h"
+
 
 namespace leveldb {
 
@@ -83,14 +85,31 @@ Version::~Version() {
   }
 }
 
+// 这个函数应该是类似于c++里面的
 int FindFile(const InternalKeyComparator& icmp,
              const std::vector<FileMetaData*>& files,
              const Slice& key) {
   uint32_t left = 0;
   uint32_t right = files.size();
+
+  std::cout << "\n\rfiles = ";
+  for (int i = 0; i < files.size(); i++) {
+    const FileMetaData* f = files[i];
+    const Slice p = f->largest.Encode();
+    const char *data = p.data();
+    std::string str(data, p.size());
+    std::cout << str << ", ";
+  }
+  std::cout << std::endl;
+
+  // 这里在用二分查找？
+  // 相当于是lower_bound
+  // 但是只用了largest值来进行比较
   while (left < right) {
     uint32_t mid = (left + right) / 2;
     const FileMetaData* f = files[mid];
+    // 在c++ template编程里面
+    // lower_bound就是v > *mid时first = ++mid;
     if (icmp.InternalKeyComparator::Compare(f->largest.Encode(), key) < 0) {
       // Key at "mid.largest" is < "target".  Therefore all
       // files at or before "mid" are uninteresting.
@@ -101,7 +120,7 @@ int FindFile(const InternalKeyComparator& icmp,
       right = mid;
     }
   }
-  return right;
+  return left;
 }
 
 static bool AfterFile(const Comparator* ucmp,
@@ -119,47 +138,78 @@ static bool BeforeFile(const Comparator* ucmp,
 }
 
 bool SomeFileOverlapsRange(
+    // 传进来的比较器
     const InternalKeyComparator& icmp,
+    // 是不相交的排序文件?
     bool disjoint_sorted_files,
     const std::vector<FileMetaData*>& files,
     const Slice* smallest_user_key,
     const Slice* largest_user_key) {
   const Comparator* ucmp = icmp.user_comparator();
+  // 如果是相交的排序文件
+  // 这里说的是，这些文件里面
+  // [f1.small, f1.large] [f2.small, f2.large]
+  // [f3.small, f3.large]
+  // 这几个区间段都可能存在相交
   if (!disjoint_sorted_files) {
     // Need to check against all files
+    // 依次看每个文件,这里实际上在比较两个区间
     for (size_t i = 0; i < files.size(); i++) {
       const FileMetaData* f = files[i];
+      // 不相交的case
+      // [small, large] [f.small, f.large]
+      // [f.small, f.large] [small, large]
       if (AfterFile(ucmp, smallest_user_key, f) ||
           BeforeFile(ucmp, largest_user_key, f)) {
         // No overlap
       } else {
+      // 相交的Case
         return true;  // Overlap
       }
     }
+    // 如果没有找到重合的部分，那么直接返回false
     return false;
   }
 
+  // 如果files里面的所有文件的区间是不相交的
+  // 比中L1层以上的文件，所有的区间是不相交的。
+  // 相当于是天然排好序的，那么就可以直接使用二分搜索
   // Binary search over file list
   uint32_t index = 0;
+  // 如果传进来的key存在下界
   if (smallest_user_key != nullptr) {
     // Find the earliest possible internal key for smallest_user_key
-    InternalKey small(*smallest_user_key, kMaxSequenceNumber,kValueTypeForSeek);
+    // [下界，最大的seq序号, 非删除类型的Key]
+    InternalKey small(*smallest_user_key, kMaxSequenceNumber, kValueTypeForSeek);
+    // 通过Encode之后，二分搜索一下文件里面是否可以找到相应的key
     index = FindFile(icmp, files, small.Encode());
   }
 
+  // 如果index >= 整个数组的size
+  // 那么肯定超标了
   if (index >= files.size()) {
     // beginning of range is after all files, so no overlap.
     return false;
   }
-
+  // 如果找到一个区间[f.small, f.large], 其中f.large > smallest_user_key
+  // 那么[user_small, user_large]要与[f.small, f.large]不相交，那么只需要
+  // user_large < f.small就可以了
+  // 如果是相交，那么就直接取!
   return !BeforeFile(ucmp, largest_user_key, files[index]);
 }
 
-// An internal iterator.  For a given version/level pair, yields
+// 一个内部使用的Iterator, 对于一个给定的version/level pair
+// 可以获得这个层级的所有的文件信息。
+// 对于一个给定的条目，key()是当前文件中最大key,
+// value():则是pair<file_number, file_size>
+// 只不过这里用了EncodedFixed64来处理
+// An internal iterator. For a given version/level pair, yields
 // information about the files in the level.  For a given entry, key()
 // is the largest key that occurs in the file, and value() is an
 // 16-byte value containing the file number and file size, both
 // encoded using EncodeFixed64.
+// 这里继承了leveldb::Iterator
+// 就是把vector里面相应的功能包装一下
 class Version::LevelFileNumIterator : public Iterator {
  public:
   LevelFileNumIterator(const InternalKeyComparator& icmp,
@@ -171,35 +221,45 @@ class Version::LevelFileNumIterator : public Iterator {
   virtual bool Valid() const {
     return index_ < flist_->size();
   }
+  // Seek就是移动，这里应该是移动到大于target的那个最开始的那个文件
   virtual void Seek(const Slice& target) {
     index_ = FindFile(icmp_, *flist_, target);
   }
+  // 跳到开头
   virtual void SeekToFirst() { index_ = 0; }
+  // index跳到最后
   virtual void SeekToLast() {
     index_ = flist_->empty() ? 0 : flist_->size() - 1;
   }
+  // 注意利用assert来判断有效性
   virtual void Next() {
     assert(Valid());
     index_++;
   }
+  // 前移
   virtual void Prev() {
     assert(Valid());
     if (index_ == 0) {
+      // 如果已经是0，那么设置为invalid
       index_ = flist_->size();  // Marks as invalid
     } else {
       index_--;
     }
   }
+  // 对应文件的largest key
+  // 是否需要在这里加一下cache
   Slice key() const {
     assert(Valid());
     return (*flist_)[index_]->largest.Encode();
   }
+  // 是否需要在这里加一下cache?
   Slice value() const {
     assert(Valid());
     EncodeFixed64(value_buf_, (*flist_)[index_]->number);
     EncodeFixed64(value_buf_+8, (*flist_)[index_]->file_size);
     return Slice(value_buf_, sizeof(value_buf_));
   }
+  // 不用看valid么？
   virtual Status status() const { return Status::OK(); }
  private:
   const InternalKeyComparator icmp_;
@@ -207,17 +267,26 @@ class Version::LevelFileNumIterator : public Iterator {
   uint32_t index_;
 
   // Backing store for value().  Holds the file number and size.
+  // mutable主要是为了使用在const函数中
   mutable char value_buf_[16];
 };
 
+/*
+ * 这个函数的功能就是从TableCache* arg中找到file_number & file_size
+ * 然后生成TableCache中的Iterator
+ */
+// arg是一个TableCache
+// 这里返回的Iterator是leveldb的iterator
 static Iterator* GetFileIterator(void* arg,
                                  const ReadOptions& options,
                                  const Slice& file_value) {
+  // Q: TableCache是所有sstable文件的LRU cache?
   TableCache* cache = reinterpret_cast<TableCache*>(arg);
   if (file_value.size() != 16) {
     return NewErrorIterator(
         Status::Corruption("FileReader invoked with unexpected value"));
   } else {
+    // file_value与前面一样，仍然是file_number & file_size.
     return cache->NewIterator(options,
                               DecodeFixed64(file_value.data()),
                               DecodeFixed64(file_value.data() + 8));
@@ -227,24 +296,48 @@ static Iterator* GetFileIterator(void* arg,
 Iterator* Version::NewConcatenatingIterator(const ReadOptions& options,
                                             int level) const {
   return NewTwoLevelIterator(
-      new LevelFileNumIterator(vset_->icmp_, &files_[level]),
-      &GetFileIterator, vset_->table_cache_, options);
+      // 利用files_[level]这个vector
+      // 生成相应的iterator
+      new LevelFileNumIterator(
+        vset_->icmp_,
+        &files_[level]
+      ),
+      // 
+      &GetFileIterator,
+      // 相应的table_cache_
+      vset_->table_cache_,
+      options
+    );
 }
 
+// 把这个版本各个level的文件
+// 生成相应的Iterator，然后append到iters里面。
+// 注意：level0由于文件里面是有各种重复的，所以处理方式会不太一样。
+// level 1 ~ 7 则是保证有序的
 void Version::AddIterators(const ReadOptions& options,
                            std::vector<Iterator*>* iters) {
+  // 把所有level 0文件合并到一起
+  // 因为level 0的文是有可能重叠的
   // Merge all level zero files together since they may overlap
   for (size_t i = 0; i < files_[0].size(); i++) {
     iters->push_back(
+        // 这里的iterator并不是连续的，所以用的是
+        // table_cache_的Iterator
+        // Q: 如果是这样操作，那么iters这个
+        // vector里面的iterator如何保证有序？
         vset_->table_cache_->NewIterator(
             options, files_[0][i]->number, files_[0][i]->file_size));
   }
 
+  // 对于所有连续的iterator, 那么就顺序依次放到iters里面
   // For levels > 0, we can use a concatenating iterator that sequentially
   // walks through the non-overlapping files in the level, opening them
   // lazily.
   for (int level = 1; level < config::kNumLevels; level++) {
     if (!files_[level].empty()) {
+      // 这里生成的是一个两级的Iterator
+      // Concatenating表示串联，这里应该是连续的意思
+      // 也就是ConcatenatingIterator是前后有序的Iterator
       iters->push_back(NewConcatenatingIterator(options, level));
     }
   }
@@ -662,16 +755,31 @@ class VersionSet::Builder {
     base_->Unref();
   }
 
+  // 把VersionEdit Apply到Builder上
   // Apply all of the edits in *edit to the current state.
   void Apply(VersionEdit* edit) {
     // Update compaction pointers
+    // compact_pointers_只是一个vector
+    // 里面的元素是一个pair，first元素表示level, second表示相应层里面合并到的
+    // key
     for (size_t i = 0; i < edit->compact_pointers_.size(); i++) {
+      // 取得层数
       const int level = edit->compact_pointers_[i].first;
+      // version_set_里面的compact_pointers_定义是不一样的
+      // std::string compact_pointer_[config::kNumLevels];
+      // 所以这里直接使用level作为索引
+      // 由于是版本的apply，那么总归是后面的一个versionEdit去覆盖前面的
+      // version edit的内容。
+      // 所以这里直接采用赋值
       vset_->compact_pointer_[level] =
           edit->compact_pointers_[i].second.Encode().ToString();
     }
 
     // Delete files
+    // 注意edit->deleted_files这个set里面的元素
+    // 也是一个pair, pair.first表示level
+    // pair.second表示文件号
+    // 这里直接使用了文件号，没有使用文件名
     const VersionEdit::DeletedFileSet& del = edit->deleted_files_;
     for (VersionEdit::DeletedFileSet::const_iterator iter = del.begin();
          iter != del.end();
@@ -683,8 +791,11 @@ class VersionSet::Builder {
 
     // Add new files
     for (size_t i = 0; i < edit->new_files_.size(); i++) {
+      // 取层数
       const int level = edit->new_files_[i].first;
+      // 根据文件的编号取出文件相应的信息
       FileMetaData* f = new FileMetaData(edit->new_files_[i].second);
+      // 设置文件的引用
       f->refs = 1;
 
       // We arrange to automatically compact this file after
@@ -700,14 +811,18 @@ class VersionSet::Builder {
       // same as the compaction of 40KB of data.  We are a little
       // conservative and allow approximately one seek for every 16KB
       // of data before triggering a compaction.
+      // 文件大小除以16K可以得到允许的seek次数
+      // 其实这个可以做成一个配置项
       f->allowed_seeks = (f->file_size / 16384);
       if (f->allowed_seeks < 100) f->allowed_seeks = 100;
 
+      // 注意要把deleted_files里面去掉这个文件number.
       levels_[level].deleted_files.erase(f->number);
       levels_[level].added_files->insert(f);
     }
   }
 
+  // 从Builder中导出Version
   // Save the current state in *v.
   void SaveTo(Version* v) {
     BySmallestKey cmp;
@@ -801,6 +916,10 @@ VersionSet::~VersionSet() {
   delete descriptor_file_;
 }
 
+// 这里实际上就是在插入到一个双向链表中
+// 注意：current总是指向最后append的Version
+// 也就是说，整个VersionSet里面保持了一个
+// 先后顺序
 void VersionSet::AppendVersion(Version* v) {
   // Make "v" current
   assert(v->refs_ == 0);
@@ -904,6 +1023,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
 }
 
 Status VersionSet::Recover(bool *save_manifest) {
+  //  报错用的代码，可以先不用管
   struct LogReporter : public log::Reader::Reporter {
     Status* status;
     virtual void Corruption(size_t bytes, const Status& s) {
@@ -911,19 +1031,25 @@ Status VersionSet::Recover(bool *save_manifest) {
     }
   };
 
+  // 从CURRENT文件中读取manifest的文件
   // Read "CURRENT" file, which contains a pointer to the current manifest file
   std::string current;
   Status s = ReadFileToString(env_, CurrentFileName(dbname_), &current);
   if (!s.ok()) {
     return s;
   }
+  // 如果读出来的 current string里面啥都没有
+  // 并且格式不满足要求，那么就直接报错
   if (current.empty() || current[current.size()-1] != '\n') {
     return Status::Corruption("CURRENT file does not end with newline");
   }
+  // 去掉最后的换行符
   current.resize(current.size() - 1);
-
+  // 生成manifest文件的路径
   std::string dscname = dbname_ + "/" + current;
   SequentialFile* file;
+  // 打开manifest文件
+  // WAL log_reader
   s = env_->NewSequentialFile(dscname, &file);
   if (!s.ok()) {
     if (s.IsNotFound()) {
@@ -941,17 +1067,30 @@ Status VersionSet::Recover(bool *save_manifest) {
   uint64_t last_sequence = 0;
   uint64_t log_number = 0;
   uint64_t prev_log_number = 0;
+
+  // 这里生成一个VersionEdit的Apply对象
+  // 操作基础版本指向current_
+  // 一个VersionEdit类似于个delta。
   Builder builder(this, current_);
 
   {
     LogReporter reporter;
     reporter.status = &s;
+    // log_reader.cc里面的WAL读者
+    // 这里指向manifest文件
     log::Reader reader(file, &reporter, true/*checksum*/, 0/*initial_offset*/);
     Slice record;
     std::string scratch;
+    // 这里读取的是用户一次性存取的一个记录
+    // 而不是WAL里面切分的record.
+    // 这个记录是完整的
+    // scratch没有什么用。
     while (reader.ReadRecord(&record, &scratch) && s.ok()) {
+      // 利用decode取出VersionEdit
       VersionEdit edit;
       s = edit.DecodeFrom(record);
+      // 如果解码成功，那看一下这个version edit里面的
+      // key 比较器是否与传进来的是一致的。
       if (s.ok()) {
         if (edit.has_comparator_ &&
             edit.comparator_ != icmp_.user_comparator()->Name()) {
@@ -960,11 +1099,16 @@ Status VersionSet::Recover(bool *save_manifest) {
               icmp_.user_comparator()->Name());
         }
       }
-
+      // 如果前面的操作成功，那么接下来就把edit添加到builder上
       if (s.ok()) {
         builder.Apply(&edit);
       }
-
+      // 更新log_number.
+      // 这里几个have_xxx变量只是为了后面用来做检测用
+      // 因为VersionEdit里面必须包含相应的
+      // log_number
+      // next_file_number_
+      // last_sequence
       if (edit.has_log_number_) {
         log_number = edit.log_number_;
         have_log_number = true;
@@ -990,6 +1134,11 @@ Status VersionSet::Recover(bool *save_manifest) {
   file = nullptr;
 
   if (s.ok()) {
+    // 这里是检查version edit是否设置next_file
+    // log_nubmer
+    // last_sequence
+    // 这三个变量在version edit里面是必须包含的
+    // 这里相当于做个检测
     if (!have_next_file) {
       s = Status::Corruption("no meta-nextfile entry in descriptor");
     } else if (!have_log_number) {
@@ -1002,22 +1151,41 @@ Status VersionSet::Recover(bool *save_manifest) {
       prev_log_number = 0;
     }
 
+    // MarkFileNumberUsed(number):
+    // if (next_file_number_ <= number) {
+    //  next_file_number_ = number + 1;
+    // }
+    // 就是把小于prev_log_number | log_number的
+    // 序号都作废
+    // next_file_number_ 移到number + 1
+    // 等价于
+    // next_file_number_ = std::max(next_file_number_,
+    //                     std::max(prev_log_number, log_number) + 1)
     MarkFileNumberUsed(prev_log_number);
     MarkFileNumberUsed(log_number);
   }
 
+  // 当所有的VersionEdit都添加完毕之后
   if (s.ok()) {
+    // 生成一个新的version
     Version* v = new Version(this);
+    // 把结果保存到这个version里面
     builder.SaveTo(v);
     // Install recovered version
+    // Finalize就是重新计算一下每一个level接下来应该合并的层
     Finalize(v);
+    // 把这个version添加到version_set的双向链表中去
     AppendVersion(v);
+    // 更新文件序号
     manifest_file_number_ = next_file;
     next_file_number_ = next_file + 1;
     last_sequence_ = last_sequence;
     log_number_ = log_number;
     prev_log_number_ = prev_log_number;
 
+    // 是否需要重用manifest文件
+    // 这里会根据option里面传进来的设定，以及各种限制
+    // 比如文件size太大，新建不成功等等原因来决定。
     // See if we can reuse the existing MANIFEST file.
     if (ReuseManifest(dscname, current)) {
       // No need to save new manifest
@@ -1187,6 +1355,10 @@ uint64_t VersionSet::ApproximateOffsetOf(Version* v, const InternalKey& ikey) {
   return result;
 }
 
+/*
+ * 功能：把整个version_set双向链表里面的version里面的
+ * 所有level里面的所有文件，都添加到live中去
+ */
 void VersionSet::AddLiveFiles(std::set<uint64_t>* live) {
   for (Version* v = dummy_versions_.next_;
        v != &dummy_versions_;

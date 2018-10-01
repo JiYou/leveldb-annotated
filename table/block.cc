@@ -73,6 +73,7 @@ static inline const char* DecodeEntry(const char* p, const char* limit,
   return p;
 }
 
+// 重点是看这个Iter
 class Block::Iter : public Iterator {
  private:
   const Comparator* const comparator_;

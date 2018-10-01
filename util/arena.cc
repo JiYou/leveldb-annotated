@@ -39,8 +39,13 @@ char* Arena::AllocateFallback(size_t bytes) {
 }
 
 char* Arena::AllocateAligned(size_t bytes) {
+  // 如果sizeof(void*)比8还要大，也就是遇到更高位的机器了？
+  // 如果更大，就用sizeof(void*)来对齐
+  // 否则就是用8来进行对齐
   const int align = (sizeof(void*) > 8) ? sizeof(void*) : 8;
+  // 确保是2的指数次方
   assert((align & (align-1)) == 0);   // Pointer size should be a power of 2
+  // 
   size_t current_mod = reinterpret_cast<uintptr_t>(alloc_ptr_) & (align-1);
   size_t slop = (current_mod == 0 ? 0 : align - current_mod);
   size_t needed = bytes + slop;

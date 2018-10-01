@@ -7,14 +7,20 @@
 namespace leveldb {
 
 Iterator::Iterator() {
+  // 初始化双向链表
+  // 很奇怪的一点是：既然都用c++了
+  // 那为什么不使用std::list<>
   cleanup_head_.function = nullptr;
   cleanup_head_.next = nullptr;
 }
 
 Iterator::~Iterator() {
+  // 如果双向链表不是空的
+  // 那么依次清空这个双向链表
   if (!cleanup_head_.IsEmpty()) {
     cleanup_head_.Run();
     for (CleanupNode* node = cleanup_head_.next; node != nullptr; ) {
+      // 调用相应的回调函数
       node->Run();
       CleanupNode* next_node = node->next;
       delete node;
@@ -24,6 +30,10 @@ Iterator::~Iterator() {
 }
 
 void Iterator::RegisterCleanup(CleanupFunction func, void* arg1, void* arg2) {
+  // 注册清理函数
+  // 如果使用std::list<>
+  // 那么也就是一个push_back()搞定的事
+  // 这里相当于是自己维护了一个双向链表 
   assert(func != nullptr);
   CleanupNode* node;
   if (cleanup_head_.IsEmpty()) {
@@ -65,6 +75,9 @@ Iterator* NewEmptyIterator() {
   return new EmptyIterator(Status::OK());
 }
 
+// 这里并没有限制Status的范围
+// 这里按理说应该需要设置是所有error status
+// 的种类
 Iterator* NewErrorIterator(const Status& status) {
   return new EmptyIterator(status);
 }

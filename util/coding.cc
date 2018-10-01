@@ -164,6 +164,7 @@ bool GetVarint64(Slice* input, uint64_t* value) {
   if (q == nullptr) {
     return false;
   } else {
+    //  注意DecodeFrom/GetVarxxx都是需要移动input的。
     *input = Slice(q, limit - q);
     return true;
   }

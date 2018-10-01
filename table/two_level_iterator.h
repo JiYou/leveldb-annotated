@@ -21,12 +21,17 @@ struct ReadOptions;
 // Uses a supplied function to convert an index_iter value into
 // an iterator over the contents of the corresponding block.
 Iterator* NewTwoLevelIterator(
+    // data block index: iterator
     Iterator* index_iter,
+    // data block: iterator生成器
     Iterator* (*block_function)(
         void* arg,
         const ReadOptions& options,
         const Slice& index_value),
+    // block_function的参数
+    // 这个参数一般是Table类
     void* arg,
+    // 各种选项
     const ReadOptions& options);
 
 }  // namespace leveldb

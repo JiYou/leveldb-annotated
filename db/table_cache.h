@@ -23,6 +23,10 @@ class TableCache {
   TableCache(const std::string& dbname, const Options& options, int entries);
   ~TableCache();
 
+  // 返回一个对应file number来说对应的iterator. 这个对应的文件的长度需要是file_size.
+  // 如果传进来的tableptr并不是空的，那么需要把tableptr指向包含iterator的TableObject
+  // 如果没有iterator对应的table object，那么就置空
+  // tableptr会一直被cache持有并且不会被删除。直到TableCache的Iterator被销毁。
   // Return an iterator for the specified file number (the corresponding
   // file length must be exactly "file_size" bytes).  If "tableptr" is
   // non-null, also sets "*tableptr" to point to the Table object
