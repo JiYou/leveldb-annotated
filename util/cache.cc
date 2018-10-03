@@ -596,7 +596,7 @@ bool LRUCache::FinishErase(LRUHandle* e) {
     assert(e->in_cache);
     // 这里只是从某个双向链表中扣出来
     LRU_Remove(e);
-    // 扣出来之后，就不再在hash table中了
+    // 扣出来之后，就不再在cache中
     e->in_cache = false;
     usage_ -= e->charge;
     Unref(e);
