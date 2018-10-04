@@ -9,21 +9,44 @@
 
 namespace leveldb {
 
+// 原理: https://blog.csdn.net/jiaomeng/article/details/1495500
+// 原理：https://www.jianshu.com/p/181f40047834
+
 namespace {
+// 把key变成一个32位的哈希值
+// 这里需要注意：使用Hash()函数的模块，seed值并不一样
 static uint32_t BloomHash(const Slice& key) {
   return Hash(key.data(), key.size(), 0xbc9f1d34);
 }
 
 class BloomFilterPolicy : public FilterPolicy {
  private:
-  size_t bits_per_key_;
+  size_t bits_per_key_; // bits_per_key_表示m／n
   size_t k_;
-
+  // m表示bit位数，而n表示key的数目
+  // 在哈希函数的个数取到最优时，要让错误率不超过e，m至少需要取到m最小值的1.44倍。
+  //  
+  // Q: 当n已知，并且希望预测错误 <= e = 0.0078125
+  //    m至少取多少合适？
+  // A： 
+  //   在错误率不大于e的情况下，m至少要等于n*log2(1/e)才能表示任意n个元素的集合。
+  //   - example: e = 0.0078125,那么1/e = 128, log2(128) = 7
+  //          : m = n*7; 那么bits_per_key = m/n = 7;
+  //
+  // Q：当n已知，那么k_个hash哈希函数，这个k_取多少合适呢？
+  // A: k = ln2· (m/n)时取得最优的哈希函数的个数
+  //    - example: e = 0.0078125, 1/e = 128
+  //             : 此时m = n*log2(1/e) = 7
+  //             : k = 0.69*7 ~= 4.9 = 5
+ 
  public:
+  // bits_per_key_表示m／n
   explicit BloomFilterPolicy(int bits_per_key)
       : bits_per_key_(bits_per_key) {
     // We intentionally round down to reduce probing cost a little bit
+    // 最优的k_是ln2 * (m/n)
     k_ = static_cast<size_t>(bits_per_key * 0.69);  // 0.69 =~ ln(2)
+    // 把k_放到[1, 30]这个区间
     if (k_ < 1) k_ = 1;
     if (k_ > 30) k_ = 30;
   }
@@ -32,30 +55,50 @@ class BloomFilterPolicy : public FilterPolicy {
     return "leveldb.BuiltinBloomFilter2";
   }
 
+  // 这里使用一系列key来创建一个bloom filter.
   virtual void CreateFilter(const Slice* keys, int n, std::string* dst) const {
     // Compute bloom filter size (in both bits and bytes)
+    // 计算总共需要的位数, n * bits_per_key
+    // 也就是说，对于每一个key需要这么多bit
+    // 因为bits_per_key_表示m／n，所以bits = m
+    // bits = bits_per_key_ * n;
     size_t bits = n * bits_per_key_;
 
     // For small n, we can see a very high false positive rate.  Fix it
     // by enforcing a minimum bloom filter length.
+    // 对于一个key，最小的bits数目设置为64.
     if (bits < 64) bits = 64;
 
+    // 取为8的倍数
     size_t bytes = (bits + 7) / 8;
+    // 根据bits算出bits数
     bits = bytes * 8;
 
+    // 扩大输出空间
     const size_t init_size = dst->size();
+    // 新增加了bytes个空间
+    // 这里resize，相当于是append了bytes个0
     dst->resize(init_size + bytes, 0);
+    // 记录一下k_
     dst->push_back(static_cast<char>(k_));  // Remember # of probes in filter
+    // 这个k_是位于bytes之后。
+    // 取得当前可以输出的内存起始地址
     char* array = &(*dst)[init_size];
+    assert((*dst)[dst->size()-1] == static_cast<char>(k_));
+    // 依次处理每个key
     for (int i = 0; i < n; i++) {
       // Use double-hashing to generate a sequence of hash values.
       // See analysis in [Kirsch,Mitzenmacher 2006].
       uint32_t h = BloomHash(keys[i]);
+      // 回环向右移动17位?
+      // 原因？
       const uint32_t delta = (h >> 17) | (h << 15);  // Rotate right 17 bits
+      // 
       for (size_t j = 0; j < k_; j++) {
-        const uint32_t bitpos = h % bits;
+        const uint32_t bitpos = h % bits; // 本来应该直接把h bit设置为1的。
+        // 但是这里总共只有bits个bit
         array[bitpos/8] |= (1 << (bitpos % 8));
-        h += delta;
+        h += delta; // 累加来实现k个hash函数
       }
     }
   }

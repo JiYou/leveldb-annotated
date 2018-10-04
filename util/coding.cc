@@ -6,6 +6,8 @@
 
 namespace leveldb {
 
+// 编码固定的32位值
+// 这里是按照小端格式来进行编码
 void EncodeFixed32(char* buf, uint32_t value) {
   if (port::kLittleEndian) {
     memcpy(buf, &value, sizeof(value));
@@ -17,6 +19,8 @@ void EncodeFixed32(char* buf, uint32_t value) {
   }
 }
 
+// 编码是固定的64位值来编码
+// 也是按照小端格式来编码
 void EncodeFixed64(char* buf, uint64_t value) {
   if (port::kLittleEndian) {
     memcpy(buf, &value, sizeof(value));

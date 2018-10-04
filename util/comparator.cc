@@ -37,19 +37,27 @@ class BytewiseComparatorImpl : public Comparator {
       diff_index++;
     }
 
+    // 如果超出长度，这里就用start
     if (diff_index >= min_length) {
       // Do not shorten if one string is a prefix of the other
     } else {
+      // 找到不一样的值
       uint8_t diff_byte = static_cast<uint8_t>((*start)[diff_index]);
+      // 如果这个  v < 0xff && (v+1) < limit[pos]
+      // 那么就直接自加
+      // 并且缩小start的长度
       if (diff_byte < static_cast<uint8_t>(0xff) &&
           diff_byte + 1 < static_cast<uint8_t>(limit[diff_index])) {
         (*start)[diff_index]++;
+        // 注意：前面那行代码可以访问diff_index
+        // 就算以diff_index结尾，整个长度都是diff_index + 1
         start->resize(diff_index + 1);
         assert(Compare(*start, limit) < 0);
       }
     }
   }
 
+  // Successor后继者
   virtual void FindShortSuccessor(std::string* key) const {
     // Find first character that can be incremented
     size_t n = key->size();
@@ -66,6 +74,7 @@ class BytewiseComparatorImpl : public Comparator {
 };
 }  // namespace
 
+// 注意这个有趣的单件模式!
 static port::OnceType once = LEVELDB_ONCE_INIT;
 static const Comparator* bytewise;
 
