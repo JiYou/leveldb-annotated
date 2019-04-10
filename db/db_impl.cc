@@ -646,10 +646,14 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
 Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
                                 Version* base) {
   mutex_.AssertHeld();
+  // 记录一下时间，不用管
   const uint64_t start_micros = env_->NowMicros();
 
   FileMetaData meta;
+  // 向db要一个新的file_number
+  // 由于现在已经有锁了，所以直接++就可以了
   meta.number = versions_->NewFileNumber();
+
   // 这里记住这个文件的编号正在准备要写入到磁盘上，
   // 或者磁盘上的这个文件正在被写入
   // 并且这个文件还没有放到levels里面
@@ -660,15 +664,20 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   // 因为后面要遍历整个immu_
   // 所以这里先拿一个iterator出来
   // 注意，刚拿出来的时候，这个iterator还是不能直接被使用的
+  // LevelDB里面设计的Iterator生成的时候，都是与STL的不一样。
+  // 需要先assign一下位置，才可以继续使用
   Iterator* iter = mem->NewIterator();
+  // 打印消息，不用看
   Log(options_.info_log, "Level-0 table #%llu: started",
       (unsigned long long) meta.number);
 
   Status s;
   {
     // 生成sst文件
+    // 这里把锁释放掉
     mutex_.Unlock();
     s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
+    // 重新拿到锁
     mutex_.Lock();
   }
 
@@ -677,6 +686,8 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
       (unsigned long long) meta.file_size,
       s.ToString().c_str());
   delete iter;
+  // 文件已经刷写到了磁盘上
+  // 这里是否应该等加到某个level之后再从pending_outpus_中移出?
   pending_outputs_.erase(meta.number);
 
   // Note that if file_size is zero, the file has been deleted and
@@ -686,32 +697,58 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   if (s.ok() && meta.file_size > 0) {
     const Slice min_user_key = meta.smallest.user_key();
     const Slice max_user_key = meta.largest.user_key();
+    // 如果base version不为空
+    // 那么想办法找到最适合的level来进行输出
     if (base != nullptr) {
       level = base->PickLevelForMemTableOutput(min_user_key, max_user_key);
     }
+    // 把file添加到某个级别
+    // 当然默认是level 0
     edit->AddFile(level, meta.number, meta.file_size,
                   meta.smallest, meta.largest);
   }
 
   // 记录一下compact的状态
   CompactionStats stats;
-  stats.micros = env_->NowMicros() - start_micros;
-  stats.bytes_written = meta.file_size;
-  stats_[level].Add(stats);
+  stats.micros = env_->NowMicros() - start_micros; // compact的用时
+  stats.bytes_written = meta.file_size; // 写到磁盘上的size
+  stats_[level].Add(stats); // 添加状态,也就是这个level上的compact状态
   return s;
 }
 
+// 由于CompactMemTable基本上都是后后台线程trigger的
+// 而后台线程的在BackgroundWork()那里会去拿到锁。
+// 所以这里肯定是已经拿到锁了
 void DBImpl::CompactMemTable() {
   mutex_.AssertHeld();
   assert(imm_ != nullptr);
 
   // Save the contents of the memtable as a new Table
+  // version 常量类型是描述一个静态的状态的，不可更改。
+  // 比如手里有一个苹果。能够清晰准确地传达手里面苹果的数量为1。
   Version* base = versions_->current();
+  // 这里对current增加引用
+  // 详细的可以看一下https://zhuanlan.zhihu.com/p/44584617
+  // 主要是version里面记录了各个层次的文件。
+  // 如果某些文件因为合并之后，不再被读取，那么这些文件
+  // 就没有存在的必要了。是可以被删除掉的。
   base->Ref();
 
+  // delta类型是一种操作，比如：来，给你一个苹果。
+  // 这个delta类型是增加的，并不能清晰的描述出手里苹果的数量。
+  // VersionEdit就是这种delta类型.
+  // VersionSet::Builder则是完成加号的操作
+  // A + B + B = D
+  // 在levelDB中则需要写成如下形式
+  // VersionSet::Builder build(A); // 这里把A做为基础项
+  // build.Apply(B);               // 累加B
+  // build.Apply(B);               // 累加B
+  // build.SaveTo(&D);             // 把结果保存到D
   VersionEdit edit;
+  // 这里把imm_写到文件中去
   Status s = WriteLevel0Table(imm_, &edit, base);
 
+  // imm_写到新文件之后，把原来的base version解引用
   base->Unref();
 
   if (s.ok() && shutting_down_.Acquire_Load()) {
@@ -851,6 +888,14 @@ void DBImpl::MaybeScheduleCompaction() {
     // 生成一个任务，放到任务队列中
     // 然后开始处理
     // 这里实际上就是去调用BackgroundCompaction()
+    // NOTE: 这里是一个异步操作，只是把任务扔到Queue
+    // 里面开始返回。
+    // MaybeScheduleCompaction相当于
+    // TriggerCompactionAction
+    // 简单地触发一下之后，然后就开始返回
+    // 由于是异步，那么返回之后，db的锁很有可能已经释放掉了
+    // 所以，真正的BGWork即->BackgroundCall()
+    // 开始的时候，需要重新去拿锁。
     env_->Schedule(&DBImpl::BGWork, this);
   }
 }
@@ -858,6 +903,27 @@ void DBImpl::MaybeScheduleCompaction() {
 void DBImpl::BGWork(void* db) {
   reinterpret_cast<DBImpl*>(db)->BackgroundCall();
 }
+
+// 这里是后台任务在执行
+// 如果同时存在写入线程，与后台任务线程在跑，那么这里就会
+// 同时去拿锁。
+// 需要注意的是：MaybeScheduleCompaction()是需要在持有锁的情况下执行的。
+// 所以mutex_.AssertHeld();
+// 相当于代码结构是
+// Thread 1.
+// DBImpl::Write() {
+//     MutexLock l(&mutex_);
+//     // in some case need to trigger compaction.
+//     MaybeScheduleCompaction(); <-- 这里实际上并不真正执行compaction.
+//                                    // 只是生成一个task结构放到后台Queue中
+//     // 完成之后，mutex被释放
+// }
+// 后台线程中的Task item被解开之后，开始要来持行compaction.
+// Thread 2.
+// DBImpl::BackgroundCall() {// 后台任务
+//     MutexLock l(&mutex_);
+//     // 准备compaction.
+// }
 
 void DBImpl::BackgroundCall() {
   MutexLock l(&mutex_);
@@ -880,29 +946,59 @@ void DBImpl::BackgroundCall() {
 
   // Previous compaction may have produced too many files in a level,
   // so reschedule another compaction if needed.
+  // BackgroundCompaction()有可能会在某个层级产生太多的文件
+  // 根据需要，这里就开始调度生成另外一个compaction来处理这些
+  // 新生成的过多的文件。
   MaybeScheduleCompaction();
+  // NOTE：这里重新trigger compaction。有点类假于
+  // thread + queue + 异步的递归调用
+  // 只不过这个是在线程情况下，使用queue + task_item来完成的。
+  // 注意与通常的函数写法上的递归调用的不同。
   background_work_finished_signal_.SignalAll();
 }
-
+/*
+ * 简要总结一下下面这个函数所做的事情
+ * 1. 如果发需要做mem compaction. -> do -> return
+ * 2. 检查是否需要manual compaction，更新相应区间:
+ *    a. manual compaction的区间信息
+ *    b. size/seek compaction的区间信息
+ * 3. 是否可以trivial compaction
+ * 4. compaction work
+ * 5. 更新compaction状态
+ */
 void DBImpl::BackgroundCompaction() {
   mutex_.AssertHeld();
 
+  // 最高优先级1
+  //  memtable compaction.
   // 因为mm_是满足大小为4MB的时候才会转化成为imm_
   // 所以这里如果发现为非空，那么直接就
   // compact memtable.
   if (imm_ != nullptr) {
-    CompactMemTable();
+    CompactMemTable(); // 这里比较简单，就是把内存文件写入到level0
+    // 至于生成了太多level0文件，需要compaction。那么就是在
+    // BackgroundCall() -> MaybeScheduleCompaction()
+    // 再次触发来完成的了。
+    // 有点像形成了递归调用。
+    // 只不过是基于后台线程 + Queue的递归调用
+    // 并且是异步的
     return;
   }
 
   Compaction* c;
+  // 看一下是否设置了手动compaction.
+  // 在ceph中会主动调用，进而触发compaction.
   bool is_manual = (manual_compaction_ != nullptr);
-  InternalKey manual_end;
+  InternalKey manual_end; // 记录manual compaction的尾巴
   if (is_manual) {
     ManualCompaction* m = manual_compaction_;
+    // Compact指定level的指定区间
     c = versions_->CompactRange(m->level, m->begin, m->end);
+    // 看一下是否结束
     m->done = (c == nullptr);
+    // 如果compaction没有结束，那么是需要更新一下manual_end
     if (c != nullptr) {
+      // 这里是通过compact result拿到最终的那个largest_key
       manual_end = c->input(0, c->num_input_files(0) - 1)->largest;
     }
     Log(options_.info_log,
@@ -918,7 +1014,13 @@ void DBImpl::BackgroundCompaction() {
   Status status;
   if (c == nullptr) {
     // Nothing to do
+
+  // 这个if的判断是说，如果不是manual的，并且可以直接把文件并到高层去。
+  // 那么就直接移动一下就可以了。
   } else if (!is_manual && c->IsTrivialMove()) {
+    // 是否需要移动Trivial：不重要的，微不足道的
+    // 返回 True,trivial Compaction，则直接将文件移入 level + 1 层即可
+    // 也就是说，这个文件比较独立，可以直接移动到更高的层级
     // Move file to next level
     assert(c->num_input_files(0) == 1);
     FileMetaData* f = c->input(0, 0);
@@ -929,6 +1031,8 @@ void DBImpl::BackgroundCompaction() {
     if (!status.ok()) {
       RecordBackgroundError(status);
     }
+
+    // 这个不用管，LevelSummaryStorage只是用来生成可读性较强的信息。
     VersionSet::LevelSummaryStorage tmp;
     Log(options_.info_log, "Moved #%lld to level-%d %lld bytes %s: %s\n",
         static_cast<unsigned long long>(f->number),
@@ -936,6 +1040,9 @@ void DBImpl::BackgroundCompaction() {
         static_cast<unsigned long long>(f->file_size),
         status.ToString().c_str(),
         versions_->LevelSummary(&tmp));
+  
+  // 如果不能把level i的文件放到level i + 1层上去
+  // 那么就老老实实干合并的工作吧。
   } else {
     CompactionState* compact = new CompactionState(c);
     status = DoCompactionWork(compact);
@@ -946,8 +1053,10 @@ void DBImpl::BackgroundCompaction() {
     c->ReleaseInputs();
     DeleteObsoleteFiles();
   }
+  // 如果c为空，这里会不会炸掉?
   delete c;
 
+  // 这里只是简单地看一下是否需要输出compaction的错误信息
   if (status.ok()) {
     // Done
   } else if (shutting_down_.Acquire_Load()) {
@@ -958,16 +1067,32 @@ void DBImpl::BackgroundCompaction() {
   }
 
   if (is_manual) {
+    // m没有别的用途，就是为了后面写变量名不用写manual_compaction_这么长
     ManualCompaction* m = manual_compaction_;
+    // 如果状态不好，那么直接设置为OK
     if (!status.ok()) {
       m->done = true;
     }
+    // 如果没有完成，那么需要更新trigger manual compaction里面的局部变量
+    // 作为提示信息，返回给调用者，让调用者知道compactoin的状态
     if (!m->done) {
       // We only compacted part of the requested range.  Update *m
       // to the range that is left to be compacted.
-      m->tmp_storage = manual_end;
+      m->tmp_storage = manual_end; // tmp_storage就是内部类一个非常临时的中转站
+      // 可能是因为m->begin类型就是设置成为一个指针类型。
+      // 这个时候，突然要指向一个区间段的中间的元素，这时
+      // 只能是在类内部生成一个临时变量
       m->begin = &m->tmp_storage;
     }
+    // 这里更新掉之后，表示不再引用?
+    // 注意看一下，manual_compaction_只是一个指针
+    // 由触发manual compaction的函数，在函数的内
+    // DBImpl::CompactRange(b, e) {
+    //    temp_m = ManualCompaction();
+    //    db->manual_compaction_ = &temp_m;
+    // }
+    // 所以这里使用完成之后，表示manual compaction已经完成
+    // 所以这里需要置空
     manual_compaction_ = nullptr;
   }
 }

@@ -940,14 +940,20 @@ void VersionSet::AppendVersion(Version* v) {
   v->next_->prev_ = v;
 }
 
+// 总结一下这个函数就是：
+// 把关于level files的修改添加到current_
+// 之上，然后生成一个新的版本。
+// 并且把这个版本添加到version set上.
 Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
+  // 这里一堆前向兼容的代码直接不看了
+  // log_number_
+  // prev_log_number_都不用管
   if (edit->has_log_number_) {
     assert(edit->log_number_ >= log_number_);
     assert(edit->log_number_ < next_file_number_);
   } else {
     edit->SetLogNumber(log_number_);
   }
-
   if (!edit->has_prev_log_number_) {
     edit->SetPrevLogNumber(prev_log_number_);
   }
@@ -963,6 +969,8 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     // build就是一个累加器
     // version_edit_是一个delta变量
     // 这里由于是新生成的变量，所以以current_为base
+    // 实际上就是current_ + edit = v
+    // 生成一个新的version v
     Builder builder(this, current_);
     builder.Apply(edit);
     builder.SaveTo(v);
@@ -975,22 +983,32 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   // a temporary file that contains a snapshot of the current version.
   std::string new_manifest_file;
   Status s;
+  // 这里实际上就是看一下有没有manifest文件句柄。
+  // 如果没有，那么生成一个新的，并且把当前
+  // version set当成一个snapshot写入到磁盘中去
   if (descriptor_log_ == nullptr) {
     // No reason to unlock *mu here since we only hit this path in the
     // first call to LogAndApply (when opening the database).
     assert(descriptor_file_ == nullptr);
+    // 这里根据dbname和manifest_file_number_来生成manifest文件名
+    // 注意： Status DBImpl::NewDB()
+    // 的时候，也会生成相应的manifest文件。
+    // 但是当生成完毕后，那个manifest文件内存fd就被释放掉了
     new_manifest_file = DescriptorFileName(dbname_, manifest_file_number_);
-    edit->SetNextFile(next_file_number_);
+    edit->SetNextFile(next_file_number_); // <-- 这里没有必要重新设置吧
+
     s = env_->NewWritableFile(new_manifest_file, &descriptor_file_);
     if (s.ok()) {
       descriptor_log_ = new log::Writer(descriptor_file_);
+      // 这里写一个snapshot是说，把整个versionset作为一个映像写入到磁盘中去
       s = WriteSnapshot(descriptor_log_);
     }
   }
 
   // Unlock during expensive MANIFEST log write
   {
-    mu->Unlock();
+    mu->Unlock(); // <-- 有趣的是，大部分写磁盘的时候，锁都释放了
+    // 由于有了序号的保证，这里应该并不害怕其他线程写到相同的文件上来
 
     // Write new record to MANIFEST log
     if (s.ok()) {
@@ -1008,17 +1026,19 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
 
     // If we just created a new descriptor file, install it by writing a
     // new CURRENT file that points to it.
+    // 注意设置CURRENT FILE
     if (s.ok() && !new_manifest_file.empty()) {
       s = SetCurrentFile(env_, dbname_, manifest_file_number_);
     }
 
-    mu->Lock();
+    mu->Lock(); // 磁盘写入完成之后，重新拿到锁，开始操作内存的数据结构
   }
 
   // 前面持久化之后，这里开始修改内存的结构
   // Install the new version
   if (s.ok()) {
     AppendVersion(v);
+    // 这两个number是为了前向兼容的，不用管
     log_number_ = edit->log_number_;
     prev_log_number_ = edit->prev_log_number_;
   } else {

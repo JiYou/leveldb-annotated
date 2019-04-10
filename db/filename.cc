@@ -126,6 +126,7 @@ bool ParseFileName(const std::string& filename,
 Status SetCurrentFile(Env* env, const std::string& dbname,
                       uint64_t descriptor_number) {
   // Remove leading "dbname/" and add newline to manifest file name
+  // 注意这里写入的方式，写入的时候是通过写入一个新的文件，然后再把新文件重命名成为原来的文件
   std::string manifest = DescriptorFileName(dbname, descriptor_number);
   Slice contents = manifest;
   assert(contents.starts_with(dbname + "/"));
