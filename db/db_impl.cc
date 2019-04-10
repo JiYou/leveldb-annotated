@@ -148,6 +148,9 @@ static int TableCacheSize(const Options& sanitized_options) {
   return sanitized_options.max_open_files - kNumNonTableCacheFiles;
 }
 
+// 这里raw_options里面可能会带进来一些参数，或者已经有的值
+// 这里会有一些bool变量会查看一下当前是否会继续使用raw_option
+// 中的值
 DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
     :
       // 初始化env环境变量
@@ -161,7 +164,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
                                &internal_filter_policy_, raw_options)),
       // 是否有info_log_
       owns_info_log_(options_.info_log != raw_options.info_log),
-      // 是否有option中的cache.
+      // 是否有option中的 block cache.
       owns_cache_(options_.block_cache != raw_options.block_cache),
       // 数据库的名字
       dbname_(dbname),
@@ -248,7 +251,7 @@ Status DBImpl::NewDB() {
   new_db.SetLogNumber(0);
   // 设置接下来的文件编号
   // 接下来新的文件会使用编号2
-  // 那么中间的1呢？下面可以看到1是被Manifest文件看到了。
+  // 那么中间的1呢？下面可以看到1是被Manifest文件用掉了
   new_db.SetNextFile(2);
   // 用户提交key/value时的编号
   new_db.SetLastSequence(0);
@@ -260,7 +263,7 @@ Status DBImpl::NewDB() {
   WritableFile* file;
   // manifest文件也是一个WAL文件
   // 这里是生成相应的文件句柄
-  Status s = env_->NewWritableFile(manifest, &file);
+  Status s = env_->NewWritableFile(manifest/*manifest_file_name*/, &file);
   if (!s.ok()) {
     return s;
   }
@@ -268,6 +271,8 @@ Status DBImpl::NewDB() {
   {
     log::Writer log(file);
     std::string record;
+    // 这里是把db的各种信息编码到record里面
+    // 然后写入到wal文件中
     new_db.EncodeTo(&record);
     s = log.AddRecord(record);
     if (s.ok()) {
@@ -287,6 +292,13 @@ Status DBImpl::NewDB() {
   return s;
 }
 
+// 实际上只做了一件事，
+// - 如果状态ok, 或者说不需要做检查
+//   a. 啥也不做
+// - 否则输出出错信息
+//   b. 把状态设置为OK
+// NOTE: 状态会被更改掉
+// 
 void DBImpl::MaybeIgnoreError(Status* s) const {
   if (s->ok() || options_.paranoid_checks) {
     // No change needed
@@ -296,6 +308,10 @@ void DBImpl::MaybeIgnoreError(Status* s) const {
   }
 }
 
+// 这个函数要做的事
+// live = pending_outputs_ + files_in(version_set_);
+// all_files_in_dir = GetDBFiles()
+// to_delete_files = all_files_in_dir - live
 void DBImpl::DeleteObsoleteFiles() {
   mutex_.AssertHeld();
 
@@ -308,8 +324,13 @@ void DBImpl::DeleteObsoleteFiles() {
   }
 
   // Make a set of all of the live files
-  // 把所有等着输出的文件放到live中去
+  // pending_outputs_里面肯定是活着的文件
+  // 这个作为一个基础
   std::set<uint64_t> live = pending_outputs_;
+  // 然后再把version_set_里面所有的文件都放到live
+  // 中
+  // 达到的效果是
+  // live = pending_outputs_ + files_in(version_set_);
   versions_->AddLiveFiles(&live);
 
   // 拿出所有db/目录里面的文件
@@ -384,9 +405,12 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest) {
   // may already exist from a previous failed creation attempt.
   // 创建目录
   env_->CreateDir(dbname_);
+  // 既然是要恢复，那么肯定是没有其他人拿到了锁
   assert(db_lock_ == nullptr);
   // 创建文件锁
   Status s = env_->LockFile(LockFileName(dbname_), &db_lock_);
+  // 如果失败，那么说明其他地方有人拿了数据库的锁。
+  // 可能是别的线程或者进程
   if (!s.ok()) {
     return s;
   }
@@ -408,13 +432,14 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest) {
           dbname_, "does not exist (create_if_missing is false)");
     }
   } else {
+    // 如果存在则报错
     if (options_.error_if_exists) {
       return Status::InvalidArgument(
           dbname_, "exists (error_if_exists is true)");
     }
   }
   // 这里会从manifest里面将各种VersionEdit读出来
-  // 然后apply到current_ version上
+  // 然后apply到current_ version set上
   s = versions_->Recover(save_manifest);
   if (!s.ok()) {
     return s;
@@ -622,15 +647,26 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
                                 Version* base) {
   mutex_.AssertHeld();
   const uint64_t start_micros = env_->NowMicros();
+
   FileMetaData meta;
   meta.number = versions_->NewFileNumber();
+  // 这里记住这个文件的编号正在准备要写入到磁盘上，
+  // 或者磁盘上的这个文件正在被写入
+  // 并且这个文件还没有放到levels里面
+  // 放到pending_outputs_里面，主要是为了防止误删除
+  // 注意看DeleteAbsoluteFiles()这个函数
   pending_outputs_.insert(meta.number);
+
+  // 因为后面要遍历整个immu_
+  // 所以这里先拿一个iterator出来
+  // 注意，刚拿出来的时候，这个iterator还是不能直接被使用的
   Iterator* iter = mem->NewIterator();
   Log(options_.info_log, "Level-0 table #%llu: started",
       (unsigned long long) meta.number);
 
   Status s;
   {
+    // 生成sst文件
     mutex_.Unlock();
     s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
     mutex_.Lock();
@@ -643,9 +679,9 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   delete iter;
   pending_outputs_.erase(meta.number);
 
-
   // Note that if file_size is zero, the file has been deleted and
   // should not be added to the manifest.
+  // 看一下放到哪个层级
   int level = 0;
   if (s.ok() && meta.file_size > 0) {
     const Slice min_user_key = meta.smallest.user_key();
@@ -657,6 +693,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
                   meta.smallest, meta.largest);
   }
 
+  // 记录一下compact的状态
   CompactionStats stats;
   stats.micros = env_->NowMicros() - start_micros;
   stats.bytes_written = meta.file_size;
@@ -669,10 +706,12 @@ void DBImpl::CompactMemTable() {
   assert(imm_ != nullptr);
 
   // Save the contents of the memtable as a new Table
-  VersionEdit edit;
   Version* base = versions_->current();
   base->Ref();
+
+  VersionEdit edit;
   Status s = WriteLevel0Table(imm_, &edit, base);
+
   base->Unref();
 
   if (s.ok() && shutting_down_.Acquire_Load()) {
@@ -681,8 +720,18 @@ void DBImpl::CompactMemTable() {
 
   // Replace immutable memtable with the generated Table
   if (s.ok()) {
+    // 不用管这个prev log number
+    // 没有什么用的
+    // 完全是为了兼容旧代码
     edit.SetPrevLogNumber(0);
+    // Q: 这是一个version_edit_，这里会引用到
+    //    logfile_number_
+    //    按理说version_set/version_edit_修改的应该主要是
+    //    manifest文件做为wal_file
+    //    所以这个文件是否是manifest_file_的序号?
     edit.SetLogNumber(logfile_number_);  // Earlier logs no longer needed
+    // 把edit即对于version_set_的改动放到version_set中
+    // 针对于version_set_的改动主要是集中于level[].compact_key
     s = versions_->LogAndApply(&edit, &mutex_);
   }
 
@@ -776,20 +825,32 @@ void DBImpl::RecordBackgroundError(const Status& s) {
   }
 }
 
+// MaybeScheduleCompaction()是所有的compaction的入口
 void DBImpl::MaybeScheduleCompaction() {
+  // 确保mutex已经在手里了
   mutex_.AssertHeld();
+  // 这里面遇到以下情况是不需要做compaction的.
+  // 如果后台已经在compaction了
   if (background_compaction_scheduled_) {
     // Already scheduled
+  // 如果需要关闭数据库
   } else if (shutting_down_.Acquire_Load()) {
     // DB is being deleted; no more background compactions
+  // 如果后台出现了错误
   } else if (!bg_error_.ok()) {
     // Already got an error; no more changes
+  // 或者说并不需要compaction
+  // 那么这里立马返回
   } else if (imm_ == nullptr &&
              manual_compaction_ == nullptr &&
              !versions_->NeedsCompaction()) {
     // No work to be done
   } else {
+  // 后台的compaction开始调度
     background_compaction_scheduled_ = true;
+    // 生成一个任务，放到任务队列中
+    // 然后开始处理
+    // 这里实际上就是去调用BackgroundCompaction()
     env_->Schedule(&DBImpl::BGWork, this);
   }
 }
@@ -800,16 +861,22 @@ void DBImpl::BGWork(void* db) {
 
 void DBImpl::BackgroundCall() {
   MutexLock l(&mutex_);
+  // 既然已经开始执行，那么肯定已经经过了调度
   assert(background_compaction_scheduled_);
+  // 如果要关闭了
   if (shutting_down_.Acquire_Load()) {
     // No more background work when shutting down.
+  // 后台是不是出错了
   } else if (!bg_error_.ok()) {
     // No more background work after a background error.
   } else {
+    // 如果啥事都没有，那么开始准备compaction吧。
     BackgroundCompaction();
   }
-
+  // 注意，这里调度完成之后，需要把这个bool变量设置为false.
   background_compaction_scheduled_ = false;
+  // 因为在接下来的MaybeScheduleCompaction()会再次设置
+  // 这个变量，把这个变量设置为true.
 
   // Previous compaction may have produced too many files in a level,
   // so reschedule another compaction if needed.
@@ -820,6 +887,9 @@ void DBImpl::BackgroundCall() {
 void DBImpl::BackgroundCompaction() {
   mutex_.AssertHeld();
 
+  // 因为mm_是满足大小为4MB的时候才会转化成为imm_
+  // 所以这里如果发现为非空，那么直接就
+  // compact memtable.
   if (imm_ != nullptr) {
     CompactMemTable();
     return;

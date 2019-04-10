@@ -18,13 +18,18 @@ Status BuildTable(const std::string& dbname,
                   Env* env,
                   const Options& options,
                   TableCache* table_cache,
-                  Iterator* iter,
+                  Iterator* iter, // 如果是immu_，那么这里就是指向的skiplist.
                   FileMetaData* meta) {
   Status s;
   meta->file_size = 0;
+  // 在level db的iterator设计中
+  // 刚new 出来的iterator是不能直接用的，需要指向某个位置
   iter->SeekToFirst();
 
   std::string fname = TableFileName(dbname, meta->number);
+  // iter 有效的才进行如下操作
+  // 如果无效，就不需要进行compact
+  // 但是之前生成的number岂不是浪费了？
   if (iter->Valid()) {
     WritableFile* file;
     s = env->NewWritableFile(fname, &file);

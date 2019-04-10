@@ -660,8 +660,10 @@ PosixEnv::PosixEnv()
 }
 
 void PosixEnv::Schedule(void (*function)(void*), void* arg) {
+  // 不管这个
   PthreadCall("lock", pthread_mutex_lock(&mu_));
 
+  // 如果还没有开始线程，那么这里开始线程
   // Start background thread if necessary
   if (!started_bgthread_) {
     started_bgthread_ = true;
@@ -672,11 +674,13 @@ void PosixEnv::Schedule(void (*function)(void*), void* arg) {
 
   // If the queue is currently empty, the background thread may currently be
   // waiting.
+  // 如果这里还没有任何任务，那么等待
   if (queue_.empty()) {
     PthreadCall("signal", pthread_cond_signal(&bgsignal_));
   }
 
   // Add to priority queue
+  // 把任务放到队列中开始等待执行
   queue_.push_back(BGItem());
   queue_.back().function = function;
   queue_.back().arg = arg;
@@ -684,19 +688,24 @@ void PosixEnv::Schedule(void (*function)(void*), void* arg) {
   PthreadCall("unlock", pthread_mutex_unlock(&mu_));
 }
 
+// 后台执行任务的引擎
 void PosixEnv::BGThread() {
   while (true) {
     // Wait until there is an item that is ready to run
+    // 如果队列为空，那么等待之
     PthreadCall("lock", pthread_mutex_lock(&mu_));
     while (queue_.empty()) {
       PthreadCall("wait", pthread_cond_wait(&bgsignal_, &mu_));
     }
 
+    // 注意这里操作的顺序
     void (*function)(void*) = queue_.front().function;
     void* arg = queue_.front().arg;
     queue_.pop_front();
 
     PthreadCall("unlock", pthread_mutex_unlock(&mu_));
+
+    // 这里开始调用函数
     (*function)(arg);
   }
 }

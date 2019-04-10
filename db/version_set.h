@@ -310,6 +310,11 @@ class VersionSet {
   uint64_t manifest_file_number_;
   uint64_t last_sequence_;
   uint64_t log_number_;
+
+  // 如果注意力在新版本的leveldb
+  // 那么这个变量可以根本就不用去关心
+  // 因为实际上没有什么用
+  // 代码保留在这里，完全是为了前向见兼容
   uint64_t prev_log_number_;  // 0 or backing store for memtable being compacted
 
   // Opened lazily

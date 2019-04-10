@@ -760,8 +760,13 @@ class VersionSet::Builder {
   void Apply(VersionEdit* edit) {
     // Update compaction pointers
     // compact_pointers_只是一个vector
-    // 里面的元素是一个pair，first元素表示level, second表示相应层里面合并到的
-    // key
+    // 里面的元素是一个pair，first元素表示level,
+    // second表示相应层里面合并到的 key
+    // 这里的key就是表示当前这一次compaction合并到了哪个key
+    // 后面在合并的时候继续从这个key开始操作。
+    // NOTE: 这部分直接更新了version_set_的信息
+    // 这是因为version_set_除了维护一个版本环之外
+    // 还会保存关于整个db 每个level的信息
     for (size_t i = 0; i < edit->compact_pointers_.size(); i++) {
       // 取得层数
       const int level = edit->compact_pointers_[i].first;
@@ -780,10 +785,8 @@ class VersionSet::Builder {
     // 也是一个pair, pair.first表示level
     // pair.second表示文件号
     // 这里直接使用了文件号，没有使用文件名
-    const VersionEdit::DeletedFileSet& del = edit->deleted_files_;
-    for (VersionEdit::DeletedFileSet::const_iterator iter = del.begin();
-         iter != del.end();
-         ++iter) {
+    const auto& del = edit->deleted_files_;
+    for (auto iter = del.begin(); iter != del.end(); iter++) {
       const int level = iter->first;
       const uint64_t number = iter->second;
       levels_[level].deleted_files.insert(number);
@@ -949,15 +952,23 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     edit->SetPrevLogNumber(prev_log_number_);
   }
 
+  // 注意next file主要是指文件的序号
   edit->SetNextFile(next_file_number_);
+  // last_seq主要是指
+  // key的序号
   edit->SetLastSequence(last_sequence_);
 
   Version* v = new Version(this);
   {
+    // build就是一个累加器
+    // version_edit_是一个delta变量
+    // 这里由于是新生成的变量，所以以current_为base
     Builder builder(this, current_);
     builder.Apply(edit);
     builder.SaveTo(v);
   }
+  // 这个函数名字起得真奇怪，本质上这个函数就是只是
+  // 把version v这个版本里面需要compact的score进行一个计算就完事
   Finalize(v);
 
   // Initialize new descriptor log file if necessary by creating
@@ -984,6 +995,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     // Write new record to MANIFEST log
     if (s.ok()) {
       std::string record;
+      // 这里才是真正的持久化部分
       edit->EncodeTo(&record);
       s = descriptor_log_->AddRecord(record);
       if (s.ok()) {
@@ -1003,6 +1015,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     mu->Lock();
   }
 
+  // 前面持久化之后，这里开始修改内存的结构
   // Install the new version
   if (s.ok()) {
     AppendVersion(v);
