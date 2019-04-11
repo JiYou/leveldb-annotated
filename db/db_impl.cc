@@ -40,6 +40,7 @@ namespace leveldb {
 const int kNumNonTableCacheFiles = 10;
 
 // Information kept for every waiting writer
+// 这里就是给写的时候用的
 struct DBImpl::Writer {
   Status status;
   WriteBatch* batch;
@@ -675,7 +676,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   {
     // 生成sst文件
     // 这里把锁释放掉
-    mutex_.Unlock();
+    mutex_.Unlock(); // 这里写磁盘的时候，把锁放掉
     s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
     // 重新拿到锁
     mutex_.Lock();
@@ -1523,48 +1524,111 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
   return DB::Delete(options, key);
 }
 
+// 如果是从put函数过来。那么在DBImpl::Put那边。
+// my_batch那头就是一个局部变量
+// 当Write调用完之后那边释放
+// NOTE: 如果my_batch == nullptr
+// 那么用意就是强制来一波compaction.或者等待后面的compaction完成
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
+  // 这里并不会对mutex_上锁。只是用来生成writer里面的cond变量
   Writer w(&mutex_);
-  w.batch = my_batch;
+  w.batch = my_batch;  // <- writer指回向原来的writeBatch
   w.sync = options.sync;
   w.done = false;
 
+  // 这里一开始用了一个局变量来拿锁
+  // 在函数退出的时候，就不用手动放锁了
   MutexLock l(&mutex_);
+
+  // 放到队列中，注意，这个时候，应该是位于队尾.
+  // 放到队列中的是Writer，而不是WriteBatch
+  // 这是因为Writer是一个与db的唯一锁相关的数据结构
   writers_.push_back(&w);
+  // 如果还没有写入完成
+  // 并且队列里面还有其他的item在等着被刷写下去
   while (!w.done && &w != writers_.front()) {
     w.cv.Wait();
   }
+  // 注意，从前面的while退出
+  // 有两种情况
+  // 1. 完成了。
+  // 2. 位于队首
   if (w.done) {
     return w.status;
   }
 
+  // 如果运行到这里，就只剩下一种情况，那就是当前线程的请求位于队首.
+  // 其他线程的::Write()操作会被卡住
+
   // May temporarily unlock and wait.
+  // 当这里在刷写的时候，由于会临时地释放锁，所以可能导致的情况是
+  // 其他线程可能会拿到锁，然后往队列中往很多元素
+  // 但是由于其他线程放置的元素并不是在队首，所以会被卡住
+  // 然后当前这个线程切回来的时候，拿到锁之后，会把队列里面的所有的元素都一把写下去
+  // 这里如果是需要延迟当前写，那么会sleep(1s)。然后会把锁放掉
   Status status = MakeRoomForWrite(my_batch == nullptr);
+
+  // 这里拿到当前的最新的seq number.
   uint64_t last_sequence = versions_->LastSequence();
+  // last_writer就是位于Queue队首的item.
   Writer* last_writer = &w;
-  if (status.ok() && my_batch != nullptr) {  // nullptr batch is for compactions
+
+  // 这里有两种情况status会失败，一种是bg_error_
+  // 一种是wal log文件生成新的。
+  // NOTE: my_batch == nullptr的时候
+  // 是用触发强制compaction的
+  if (status.ok() && my_batch != nullptr) {
+    // nullptr batch is for compactions
+    // 这里生成一个WriteBatch
     WriteBatch* updates = BuildBatchGroup(&last_writer);
+    // 经过BuildBatchGroup之后，last_writer指针的指向已经不再是w了。
+    // updates 指向 WriteBatch* DBImpl::tmp_batch_
+
+    // 打包之后，需要设置一个SN
+    // 注意，只有当前的这个线程是拿到锁的，所以
     WriteBatchInternal::SetSequence(updates, last_sequence + 1);
+    // 注意，批量的写入之后，last_sn += count
     last_sequence += WriteBatchInternal::Count(updates);
 
+    // 接下来要把要写入的item追加到wal log并且更新到memtable.
     // Add to log and apply to memtable.  We can release the lock
     // during this phase since &w is currently responsible for logging
     // and protects against concurrent loggers and concurrent writes
     // into mem_.
     {
-      mutex_.Unlock();
+      mutex_.Unlock(); // <- 写磁盘的时候，又把锁放掉
+      // 注意，这个时候放掉锁，只是可以让其他线程可以把item追加到writers_这个队列中
+      // 除了前台调用::Write()的线程之外，其他读线程，以及后台压缩的线程也可能拿到锁。
+
+      // 这里把内容append到wal文件里面
       status = log_->AddRecord(WriteBatchInternal::Contents(updates));
+
+      // 看一下是否遇到了sync error?
       bool sync_error = false;
+      // 是否需要sync一把呢？
       if (status.ok() && options.sync) {
         status = logfile_->Sync();
         if (!status.ok()) {
           sync_error = true;
         }
       }
+
+      // 如果前面的wal的写入是ok的
       if (status.ok()) {
+        // 这里把信息更新到skiplist里面
+        // 注意：这个时候，虽然没有锁，但是其他的调用::Write()的线程
+        // 是不会争用skiplist的。
+        // 因为他们都还被卡在
+        // while (!w.done && &w != writers_.front()) {
+        // 这里呢。
+        // 所以代码中，有趣的是mem_并没有被锁保护起来
+        // 注意看一下声明:里面没有GUARDED_BY
         status = WriteBatchInternal::InsertInto(updates, mem_);
       }
+
+      // 重新开始拿到锁
       mutex_.Lock();
+      // 如果前面的批量写出错了
       if (sync_error) {
         // The state of the log file is indeterminate: the log record we
         // just added may or may not show up when the DB is re-opened.
@@ -1572,23 +1636,35 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
         RecordBackgroundError(status);
       }
     }
+
+    // 如果更新是类内部的temp_batch_那么把已经写入的内容清理一下
     if (updates == tmp_batch_) tmp_batch_->Clear();
 
+    // 判断，这个必须拿到锁了才能操作。
+    // 更新SN
+    // 有趣的是sn并不是在数据库里面。而是在version_set里面。
     versions_->SetLastSequence(last_sequence);
   }
 
+  // 打包写入的item
+  // 依次通知队列里面的每个元素
   while (true) {
+    // 注意，队首元素不用通知
     Writer* ready = writers_.front();
     writers_.pop_front();
+
     if (ready != &w) {
       ready->status = status;
       ready->done = true;
       ready->cv.Signal();
     }
+    // 打包好的里面的最后一个
     if (ready == last_writer) break;
   }
 
   // Notify new head of write queue
+  // 如果队列不空
+  // 那么这里唤醒它
   if (!writers_.empty()) {
     writers_.front()->cv.Signal();
   }
@@ -1599,33 +1675,54 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
 // REQUIRES: Writer list must be non-empty
 // REQUIRES: First writer must have a non-null batch
 WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
+  // 到这里运行，肯定是拿到锁的
   mutex_.AssertHeld();
+  // 当前线程是位于writers_这个queue的前面
   assert(!writers_.empty());
+
   Writer* first = writers_.front();
   WriteBatch* result = first->batch;
   assert(result != nullptr);
 
+  // 拿到当前队首的写入的item的大小
   size_t size = WriteBatchInternal::ByteSize(first->batch);
 
+  // 这里是想把几个writer一起打包走
+  // 但是如果原始的写是非常小的，那么也需要限制这个增长。
+  // 因为如果打包得太大，可能会让批量的比较小的写入较慢。
+  // NOTE: 个人觉得这里应该可以一起打包写。现在磁盘带宽一般不是问题
+  // 都是iops比较少
   // Allow the group to grow up to a maximum size, but if the
   // original write is small, limit the growth so we do not slow
   // down the small write too much.
+  // 如果size并不是特别小，那么打包为1MB
   size_t max_size = 1 << 20;
   if (size <= (128<<10)) {
+    // 如果size太小，那么这里直接打包写入弄得小一点
     max_size = size + (128<<10);
   }
 
   *last_writer = first;
+
+  // 这里依次查看队列中的每个元素
   std::deque<Writer*>::iterator iter = writers_.begin();
-  ++iter;  // Advance past "first"
+  ++iter;  // Advance past "first" 跳过了当前线程指向的front()
+
+  // 跳过了队首，然后开始依次遍历后面队列中的每个元素
   for (; iter != writers_.end(); ++iter) {
     Writer* w = *iter;
+    // 如果后面的item需要sync
+    // 或者说当前的队首元素需要sync
+    // 跳出来
     if (w->sync && !first->sync) {
       // Do not include a sync write into a batch handled by a non-sync write.
       break;
     }
 
+    // 如果写入的batch非空
+    // 这么一说还会有空的写入？
     if (w->batch != nullptr) {
+      // 看一下有没有超出size
       size += WriteBatchInternal::ByteSize(w->batch);
       if (size > max_size) {
         // Do not make batch too big
@@ -1633,33 +1730,55 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
       }
 
       // Append to *result
+      // 处理队道的batch
+      // 这个判断最好是放到逻辑外面
+      // 否则一直在for循环里面
       if (result == first->batch) {
         // Switch to temporary batch instead of disturbing caller's batch
-        result = tmp_batch_;
+        result = tmp_batch_; // temp_batch_是一个类内部的变量，并没有使用局变量或者得new一个.
         assert(WriteBatchInternal::Count(result) == 0);
         WriteBatchInternal::Append(result, first->batch);
       }
+      // 追加到BATCH里面
       WriteBatchInternal::Append(result, w->batch);
     }
+    // 更新last_writer
     *last_writer = w;
   }
+  // 返回打包后的write batch
   return result;
 }
 
 // REQUIRES: mutex_ is held
 // REQUIRES: this thread is currently at the front of the writer queue
+// 当前线程要处理的刚好是queue中的第一个元素.
+// 大部分时候force = false.如果是正常写入的数据的话。
+// force == false 表示 Do not force another compaction if have room
+// 所以force表示是/否要强制一个新的compaction.
 Status DBImpl::MakeRoomForWrite(bool force) {
   mutex_.AssertHeld();
+  // 因为当前线程指向Queue中的第一个元素
+  // 所以Q肯定不为空
   assert(!writers_.empty());
+
+  // 如果force == false表示正常写入数据
+  // 那么这个时候allow_delay就是true
+  // 也就是说，如果是正常写入数据，那么这个时候是可以被delay的。
   bool allow_delay = !force;
   Status s;
-  while (true) {
+  while (true/*延时一会退出，或者是compaction完成再退出*/) {
+    // Case 1.
+    // 看一下后台有没有出错，如果后台出错，那么就直接跳出
     if (!bg_error_.ok()) {
       // Yield previous error
       s = bg_error_;
       break;
+    
+    // Case 2.
+    // 看一下是否需要延迟写入
     } else if (
-        allow_delay &&
+        allow_delay /*如果是正常写数据，那么allow_delay = true*/ &&
+        /*如果level0的文件数大于8个文件，那么就开始准备把磁盘的写入速度慢一点*/
         versions_->NumLevelFiles(0) >= config::kL0_SlowdownWritesTrigger) {
       // We are getting close to hitting a hard limit on the number of
       // L0 files.  Rather than delaying a single write by several
@@ -1667,26 +1786,90 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       // individual write by 1ms to reduce latency variance.  Also,
       // this delay hands over some CPU to the compaction thread in
       // case it is sharing the same core as the writer.
+      // 注意当前这个线程中的元素位于队首
+      // 这里让出锁之后
+      // 其他元素会拿到的是队列，然后往队列中填入元素
+      // [current_thread thread_b thread_c thread_d ....]
+      // 但是thread_b thread_c thread_d都会被卡住，因为
+      // ::Write()函数中，会检查两个条件，一个是w.done(), &w = q.front()
+      // 这两个都不满足，所以只会放到队列中，然后被卡住。
+
       mutex_.Unlock();
+      // 延迟写入的方式就是让度线程给后台的线程，比如后台线程可能需要做一些compaction.
       env_->SleepForMicroseconds(1000);
+      // 延迟过一次了，所以这里不能再延迟写入了
       allow_delay = false;  // Do not delay a single write more than once
+      // 重新拿回queue的锁
       mutex_.Lock();
-    } else if (!force &&
+    
+    // Case 3.
+    // 如果发现是正常的写入，注意这里并没有用allow_delay变量了
+    // 并且发现skiplist里面的内存还是足够的
+    // 那么直接退出
+    // !force表示不强制compaction.
+    } else if (!force /*也就是说，如果是正常的写入*/&&
                (mem_->ApproximateMemoryUsage() <= options_.write_buffer_size)) {
       // There is room in current memtable
       break;
+
+    // Case 4.
+    // 如果发现imm_不为空，那么这里等待一下后台线程的compaction.
+    // 注意：imm_可以被直接访问，这是因为imm_是一个原子变量
+    // 并不被mutex_上锁
+    // **走到这里memtable必然已经满了**
+    // 如果需要把imm_弄到磁盘上，这个时候就需要写磁盘什么的。
+    // 这里就等一下。这里可能后台还会有任务在进行。
+    // 等后面的压缩，或者imm_到磁盘
     } else if (imm_ != nullptr) {
       // We have filled up the current memtable, but the previous
       // one is still being compacted, so we wait.
       Log(options_.info_log, "Current memtable full; waiting...\n");
+      // 这里应该是确信imm_非空的时候，后台肯定有compaction的?
+      // 由于现在持有mutex_锁，所以这里也可以检查一下
+      // if (!background_compaction_scheduled_) {
+      //    MaybeScheduledCompaction(); // 如果发现没有compaction那么这里trigger一把
+      // }
       background_work_finished_signal_.Wait();
+
+    // Case 5
+    // **走到这里memtable内存空间必然满了**
+    // **走到这里，imm_肯定已经被处理掉了**所以imm_肯定为空。
+    // 如果当前的L0文件太多，已要需要停止写入了。
+    // 那么这里也是需要等后台把任务完成。
+    // 如果这里大于stop write的文件数目
+    // 那么这里直接停下来，等待bg work finish
     } else if (versions_->NumLevelFiles(0) >= config::kL0_StopWritesTrigger) {
       // There are too many level-0 files.
       Log(options_.info_log, "Too many L0 files; waiting...\n");
+      // 由于现在持有mutex_锁，所以这里也可以检查一下
+      // if (!background_compaction_scheduled_) {
+      //    MaybeScheduledCompaction(); // 如果发现没有compaction那么这里trigger一把
+      // }
       background_work_finished_signal_.Wait();
+
+    // Case 6.
+    // **走到这里，memtable必然已经满了**
+    // **走到这里, imm_肯定已经被写到磁盘了**，所以imm_肯定为空。
+    // **走到这里，Level0的文件肯定是小于kL0_StopWritesTrigger的。也就是小于12
+    // 其他情况: 如果有空间，前面已经返回了
+    // 如果需要compaction，前面已经等待了
+    // 那么这里就是：没有空间，也不需要compaction
+    // 没有空间，那就意味着，内存写满了。那么就需要生成新的imm_.
+    //   生成新的imm_，旧的imm_怎么办呢？前面不是会判断imm_么？
+    //   如果imm_不为空，就不会跳到这里来。
+    //   所以这里的情况就是imm_已经被刷到磁盘了。mm_的空间已经满了。
+    // 注意这个LOG不是print出来的LOG。而是WAL日志，而是journal。
+    // 不需要compaction，那就意味着可以直接生成LOG。
+    // 那么就是生成新的LOG和新的memtable.
     } else {
       // Attempt to switch to a new memtable and trigger compaction of old
+      // 这里想切换到一个新的memtable并且触发compaction。把旧的数据合并掉。
+      // 这里说的是当前还有没有LOG file在被compaction.
+      // 由于versions_->NumLevelFiles(0) < config::kL0_StopWritesTrigger
+      // 在这里必然成立，所以肯定是没有LOG文件在被compaction的。
+      // PrevLogNumber指的是前面还有没有LOG文件在被合并。
       assert(versions_->PrevLogNumber() == 0);
+      // 每次重新生成level 0的文件，就都新生成一个新的LOG文件
       uint64_t new_log_number = versions_->NewFileNumber();
       WritableFile* lfile = nullptr;
       s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &lfile);
@@ -1699,12 +1882,17 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       delete logfile_;
       logfile_ = lfile;
       logfile_number_ = new_log_number;
+      // 这里切换到了一个新的WAL LOG文件
       log_ = new log::Writer(lfile);
+
+      // 这里把mem_切换到imm_，然后去trigger compaction.
       imm_ = mem_;
       has_imm_.Release_Store(imm_);
+      // 这里生成新的skiplist.
       mem_ = new MemTable(internal_comparator_);
       mem_->Ref();
       force = false;   // Do not force another compaction if have room
+      // 这里只是trigger一下，把task扔到后台的线程里面
       MaybeScheduleCompaction();
     }
   }
@@ -1806,6 +1994,7 @@ void DBImpl::GetApproximateSizes(
 
 // Default implementations of convenience methods that subclasses of DB
 // can call if they wish
+// 既使是单个的Put，这里也是放到batch里面。
 Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value) {
   WriteBatch batch;
   batch.Put(key, value);
