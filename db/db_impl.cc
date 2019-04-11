@@ -1899,15 +1899,25 @@ Status DBImpl::MakeRoomForWrite(bool force) {
   return s;
 }
 
+// 说是属性，实际上就是去拿当前db的状态
+// 比如当前db每个层级有多少个文件
+// sstable文件的情况
+// 内存的使用情况
 bool DBImpl::GetProperty(const Slice& property, std::string* value) {
   value->clear();
 
   MutexLock l(&mutex_);
+
+  // 这里就是看一下用户传进来的property里面是否有leveldb.开头
+  // 如果没有，那么返回false.
   Slice in = property;
   Slice prefix("leveldb.");
   if (!in.starts_with(prefix)) return false;
+
+  // 如果有，那么移除prefix
   in.remove_prefix(prefix.size());
 
+  // 去拿每个层级的文件数目
   if (in.starts_with("num-files-at-level")) {
     in.remove_prefix(strlen("num-files-at-level"));
     uint64_t level;
@@ -1921,6 +1931,8 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
       *value = buf;
       return true;
     }
+
+  // 去拿当前的状态
   } else if (in == "stats") {
     char buf[200];
     snprintf(buf, sizeof(buf),
@@ -1945,9 +1957,17 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
       }
     }
     return true;
+
+  // 去拿sstable相关的信息
   } else if (in == "sstables") {
     *value = versions_->current()->DebugString();
     return true;
+  
+  // 去拿内存的使用情况，这里应该是
+  // 包含了
+  // block_cache
+  // mem_
+  // imm_
   } else if (in == "approximate-memory-usage") {
     size_t total_usage = options_.block_cache->TotalCharge();
     if (mem_) {
@@ -1970,6 +1990,11 @@ void DBImpl::GetApproximateSizes(
     const Range* range, int n,
     uint64_t* sizes) {
   // TODO(opt): better implementation
+
+  // 这里只是简单的用一个锁，拿到current_ version的指针
+  // 在使用version的时候，并不需要锁
+  // 这是因为version这个类一旦生成，那么就成了只读的了。
+  // 在使用的时候，只能是只读的
   Version* v;
   {
     MutexLock l(&mutex_);
@@ -1986,6 +2011,7 @@ void DBImpl::GetApproximateSizes(
     sizes[i] = (limit >= start ? limit - start : 0);
   }
 
+  // 注意使用完之后，需要对version做unref
   {
     MutexLock l(&mutex_);
     v->Unref();
@@ -2001,6 +2027,9 @@ Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value) {
   return Write(opt, &batch);
 }
 
+// 删除一个key
+// leveldb这里就是把相应的类型定义为kDeleteType
+// 然后在后面合并的时候，直接删除掉
 Status DB::Delete(const WriteOptions& opt, const Slice& key) {
   WriteBatch batch;
   batch.Delete(key);
