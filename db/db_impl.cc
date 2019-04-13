@@ -37,23 +37,33 @@
 
 namespace leveldb {
 
+// 不需要建立table cache的文件数
 const int kNumNonTableCacheFiles = 10;
 
 // Information kept for every waiting writer
 // 这里就是给写的时候用的
 struct DBImpl::Writer {
-  Status status;
-  WriteBatch* batch;
-  bool sync;
-  bool done;
-  port::CondVar cv;
+  Status status;      // 写的状态
+  WriteBatch* batch;  // 批量写入的batch
+  bool sync;          // 是否需要刷写文件
+  bool done;          // 写入是否完成
+  port::CondVar cv;   // 这里用到的mutex与DB的mutex是同一个
 
   explicit Writer(port::Mutex* mu) : cv(mu) { }
 };
 
 struct DBImpl::CompactionState {
+  // 一个反向指针，指向最开始的compaction信息块
   Compaction* const compaction;
 
+  // 这里是说，由于每个key/value在写入的时候，都带了序号的。
+  // 那么如果在compaction的时候，发现有duplicated key,
+  // 并且这些keys'的sn里面有小于smallest_snapshot序号的
+  // 那么这些老旧的key/value就可以被删除掉了。
+  // 注意！在compaction的时候，一定有重复的key的时候，才会检这一项
+  // 如果compaction的时候，发现key/value根本没有重复，那么这个key也是不会被删除的
+  // 具体操作可以看一下DoCompactionWork这个函数。
+  // 这里英文稍微有点歧义.
   // Sequence numbers < smallest_snapshot are not significant since we
   // will never have to service a snapshot below smallest_snapshot.
   // Therefore if we have seen a sequence number S <= smallest_snapshot,
@@ -62,20 +72,29 @@ struct DBImpl::CompactionState {
 
   // Files produced by compaction
   struct Output {
+    // 文件的序号
     uint64_t number;
+    // 生成的文件的大小
     uint64_t file_size;
+    // 文件的起始key和终止key
     InternalKey smallest, largest;
   };
+  // 有可能会有多个文件生成
   std::vector<Output> outputs;
 
   // State kept for output being generated
+  // 输出文件句柄
   WritableFile* outfile;
+  // sst文件生成器，负责将数据写入到磁盘上
   TableBuilder* builder;
 
+  // 合并之后，总的生成的文件数
   uint64_t total_bytes;
 
+  // vector的最后一个元素
   Output* current_output() { return &outputs[outputs.size()-1]; }
 
+  // 显示的构造函数
   explicit CompactionState(Compaction* c)
       : compaction(c),
         outfile(nullptr),
@@ -85,6 +104,8 @@ struct DBImpl::CompactionState {
 };
 
 // Fix user-supplied options to be reasonable
+// 就是给定一个范围，当设置值小于最小值，就取最小值
+// 当设置值大于最大值，就取最大值
 template <class T, class V>
 static void ClipToRange(T* ptr, V minvalue, V maxvalue) {
   if (static_cast<V>(*ptr) > maxvalue) *ptr = maxvalue;
@@ -124,7 +145,7 @@ Options SanitizeOptions(const std::string& dbname,
     // 把原来的LOG文件重命名
     // ${dbname}/LOG -> ${dbname}/LOG.old
     src.env->RenameFile(InfoLogFileName(dbname), OldInfoLogFileName(dbname));
-    // 生成新的LOG文件
+    // 生成新的INFO LOG文件
     Status s = src.env->NewLogger(InfoLogFileName(dbname), &result.info_log);
     // 如果不成功
     if (!s.ok()) {
@@ -144,6 +165,7 @@ Options SanitizeOptions(const std::string& dbname,
   return result;
 }
 
+// 这里设置table cache最大可以cache的文件
 static int TableCacheSize(const Options& sanitized_options) {
   // Reserve ten files or so for other uses and give the rest to TableCache.
   return sanitized_options.max_open_files - kNumNonTableCacheFiles;
@@ -176,7 +198,8 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       // 是否关闭: Q: 这里为什么用指针？而不是用bool变量
       // 应该是考虑到原子性，如果这里是用cpp11，那么就应该用atomic<bool>
       shutting_down_(nullptr),
-      // 后台线程信号
+      // 后台线程信号:实际上就是指示compaction是否完成
+      // background_work_finished_signal_.wait()就是等待后台的compaction完成。
       background_work_finished_signal_(&mutex_),
       // 活跃的mem
       mem_(nullptr),
@@ -207,22 +230,25 @@ DBImpl::~DBImpl() {
   // Wait for background work to finish
   mutex_.Lock();
   shutting_down_.Release_Store(this);  // Any non-null value is ok
-  // 在退出的时候，要等后台的程序运行完成
+  // 在退出的时候，要等后台的compaction程序运行完成
   while (background_compaction_scheduled_) {
     background_work_finished_signal_.Wait();
   }
   mutex_.Unlock();
 
+  // 清理锁文件
   if (db_lock_ != nullptr) {
     env_->UnlockFile(db_lock_);
   }
 
+  // 这里都是在清理内存
   delete versions_;
   if (mem_ != nullptr) mem_->Unref();
   if (imm_ != nullptr) imm_->Unref();
   delete tmp_batch_;
   delete log_;
   delete logfile_;
+  // 清理table_cache_
   delete table_cache_;
 
   if (owns_info_log_) {
@@ -234,6 +260,7 @@ DBImpl::~DBImpl() {
 }
 /*
  * 总结一下NewDB()
+ * 这个函数并不是直接给客户端使用的，而是被Open调用
  * 1. 初始化各种序列号
  *    0给WAL日志
  *    1给manifest文件
@@ -257,7 +284,7 @@ Status DBImpl::NewDB() {
   // 用户提交key/value时的编号
   new_db.SetLastSequence(0);
   // manifest文件的编号，这里新生成的DB里面把1占用掉了。
-  const std::string manifest = DescriptorFileName(dbname_, 1);
+  const std::string manifest = DescriptorFileName(dbname_, 1/*这个是文件编号*/);
 
   // 接下来把这个生成新DB的操作通过写WAL日志的方式
   // 写到manifest文件中
@@ -332,6 +359,8 @@ void DBImpl::DeleteObsoleteFiles() {
   // 中
   // 达到的效果是
   // live = pending_outputs_ + files_in(version_set_);
+  // 这里会把version_set_里面的每个version以及每个version的LEVEL里面的
+  // 文件都放到这里面来
   versions_->AddLiveFiles(&live);
 
   // 拿出所有db/目录里面的文件
@@ -349,6 +378,12 @@ void DBImpl::DeleteObsoleteFiles() {
       bool keep = true;
       switch (type) {
         // WAL日志文件只保留两个：
+        // 注意wal文件的回收，会在两个时候发生，一个是
+        // 1. 打开db的时候，这个时候会把wal里面的内容读出来，放到skiplist中
+        // 然后再dump文件到level 0
+        // 2. 当把imm_里面的内容dump到level 0的时候
+        // 实际上，相当于把WAL LOG里面的内容整理了一把放到了level 0
+        // 这个时候，只需要把wal log扔掉，重新生成一个就可以了。
         // current log number
         // pre log number
         case kLogFile:
@@ -361,6 +396,8 @@ void DBImpl::DeleteObsoleteFiles() {
           // (in case there is a race that allows other incarnations)
           // 只保留当前的版本
           // Q: 不存snapshot么？
+          // 这是因为每次生成manifest新文件的时候，都是需要写一次snapshot
+          // 所以manifest文件的开头就是一个version_set_的snapshot
           keep = (number >= versions_->ManifestFileNumber());
           break;
         case kTableFile:
@@ -385,6 +422,8 @@ void DBImpl::DeleteObsoleteFiles() {
       if (!keep) {
         // 如果不保留
         // 那么从TableCache中移除
+        // 注意理清cache
+        // 那么类似，是不是block_cache是不是也可以被清理一下？
         if (type == kTableFile) {
           table_cache_->Evict(number);
         }
@@ -1227,14 +1266,17 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
   assert(compact->builder == nullptr);
   assert(compact->outfile == nullptr);
+
+  // 如果还没有做过snapshot，那么这里直接拿到最大的SN
   if (snapshots_.empty()) {
     compact->smallest_snapshot = versions_->LastSequence();
   } else {
+    // 如果做过snapshot，那么这里直接拿到最小的snapshot sn
     compact->smallest_snapshot = snapshots_.oldest()->sequence_number();
   }
 
   // Release mutex while we're actually doing the compaction work
-  mutex_.Unlock();
+  mutex_.Unlock(); // <-- 由于要操作的是磁盘上的数据结构，所以这里并不需要持有db内存控制结构的锁
 
   Iterator* input = versions_->MakeInputIterator(compact->compaction);
   input->SeekToFirst();
@@ -1275,6 +1317,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       last_sequence_for_key = kMaxSequenceNumber;
     } else {
       if (!has_current_user_key ||
+          // 这里是说拿到了一个新的key
           user_comparator()->Compare(ikey.user_key,
                                      Slice(current_user_key)) != 0) {
         // First occurrence of this user key
@@ -1283,6 +1326,12 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
         last_sequence_for_key = kMaxSequenceNumber;
       }
 
+      // 到这里的时候，如果发现key == pre_key
+      // 那么前面Compare() == 0
+      // 并且last_sequence_for_key = pre_key.sn
+      // 如果last_sequence_for_key <= compact->smallest_snapshot
+      // 那么说明当前的key的sn必然也是小于compact->smallest_snapshot
+      // 的。所以dro就成了定局
       if (last_sequence_for_key <= compact->smallest_snapshot) {
         // Hidden by an newer entry for same user key
         drop = true;    // (A)
