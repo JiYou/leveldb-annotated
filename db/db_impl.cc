@@ -272,6 +272,9 @@ DBImpl::~DBImpl() {
  */
 Status DBImpl::NewDB() {
   // 生成一个空的版本编辑器
+  // 注意，这玩意是一个version_edit
+  // 并不是一个真正的db.
+  // 当version_edit_没有基于任何version的时候，基本上可以看成是一个snapshot.
   VersionEdit new_db;
   // 设置DB name
   new_db.SetComparatorName(user_comparator()->Name());
@@ -443,18 +446,18 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest) {
   // Ignore error from CreateDir since the creation of the DB is
   // committed only when the descriptor is created, and this directory
   // may already exist from a previous failed creation attempt.
-  // 创建目录
+  // 1. 创建目录
   env_->CreateDir(dbname_);
-  // 既然是要恢复，那么肯定是没有其他人拿到了锁
+  // 2. 既然是要恢复，那么肯定是没有其他人拿到了锁
   assert(db_lock_ == nullptr);
-  // 创建文件锁
+  // 3. 创建文件锁
   Status s = env_->LockFile(LockFileName(dbname_), &db_lock_);
   // 如果失败，那么说明其他地方有人拿了数据库的锁。
   // 可能是别的线程或者进程
   if (!s.ok()) {
     return s;
   }
-  // 如果current文件不存在
+  // 4. 如果current文件不存在
   if (!env_->FileExists(CurrentFileName(dbname_))) {
     if (options_.create_if_missing) {
       // 通过CURRENT文件和create_if_missing
@@ -478,12 +481,18 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest) {
           dbname_, "exists (error_if_exists is true)");
     }
   }
+  
+  // 此时的versions_这个version_set_里面还啥都没有，就是一个空的双向链表
   // 这里会从manifest里面将各种VersionEdit读出来
-  // 然后apply到current_ version set上
+  // 然后apply到一个version上。再把这个version放到version_set_双向链表上
+  // 在这之前也会有一个current_ version
+  // 但是在那个version里面，里面什么都没有
   s = versions_->Recover(save_manifest);
   if (!s.ok()) {
     return s;
   }
+
+  // 最开始的SN设置为0
   SequenceNumber max_sequence(0);
 
   // Recover from all newer log files than the ones named in the
@@ -509,6 +518,8 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest) {
   // 而是扫描整个version_set里面所有的version
   // 所有level文件，都会被加到expected里面。
   std::set<uint64_t> expected;
+  // 因为已经读出了所有的manifest里面的record
+  // 所以versions_里面已经记录了所有的files.
   versions_->AddLiveFiles(&expected);
 
   uint64_t number;
@@ -541,6 +552,7 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest) {
   // Recover in the order in which the logs were generated
   std::sort(logs.begin(), logs.end());
   for (size_t i = 0; i < logs.size(); i++) {
+    // 这里就是依次把wal log里面的内容整理之后扔到level0
     s = RecoverLogFile(logs[i], (i == logs.size() - 1), save_manifest, edit,
                        &max_sequence);
     if (!s.ok()) {
@@ -550,9 +562,11 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest) {
     // The previous incarnation may not have written any MANIFEST
     // records after allocating this log number.  So we manually
     // update the file number allocation counter in VersionSet.
+    // 把log[i]的序号设置为已用。如果log[i]的序号太新的话
     versions_->MarkFileNumberUsed(logs[i]);
   }
 
+  // 更新sn
   if (versions_->LastSequence() < max_sequence) {
     versions_->SetLastSequence(max_sequence);
   }
@@ -560,9 +574,12 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest) {
   return Status::OK();
 }
 
+// 实际上就是把WAL LOG里面的内容整理一下放到level0
 Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
                               bool* save_manifest, VersionEdit* edit,
                               SequenceNumber* max_sequence) {
+  
+  // 出错处理，不管
   struct LogReporter : public log::Reader::Reporter {
     Env* env;
     Logger* info_log;
@@ -579,8 +596,10 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   mutex_.AssertHeld();
 
   // Open the log file
+  // 生成wal 文件的文件名
   std::string fname = LogFileName(dbname_, log_number);
   SequentialFile* file;
+  // 开始生成文件句柄
   Status status = env_->NewSequentialFile(fname, &file);
   if (!status.ok()) {
     MaybeIgnoreError(&status);
@@ -588,6 +607,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   }
 
   // Create the log reader.
+  // 出错处理的reporter，不管，不是核心代码，直接跳过
   LogReporter reporter;
   reporter.env = env_;
   reporter.info_log = options_.info_log;
@@ -597,6 +617,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   // paranoid_checks==false so that corruptions cause entire commits
   // to be skipped instead of propagating bad information (like overly
   // large sequence numbers).
+  // 生成一个wal log的读取器
   log::Reader reader(file, &reporter, true/*checksum*/,
                      0/*initial_offset*/);
   Log(options_.info_log, "Recovering log #%llu",
@@ -608,24 +629,35 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   WriteBatch batch;
   int compactions = 0;
   MemTable* mem = nullptr;
+
+  // 依次读出wal log里面的key/value
   while (reader.ReadRecord(&record, &scratch) &&
          status.ok()) {
+    // 如果record的格式有问题
     if (record.size() < 12) {
       reporter.Corruption(
           record.size(), Status::Corruption("log record too small"));
       continue;
     }
+
+    // 生成一个写item
     WriteBatchInternal::SetContents(&batch, record);
 
+    // 生成一个skiplist
     if (mem == nullptr) {
       mem = new MemTable(internal_comparator_);
       mem->Ref();
     }
+    // 把写请求放到skiplist里面
     status = WriteBatchInternal::InsertInto(&batch, mem);
+
+    // 这里只是看一下是否需要报错，并清整理status的状态。
     MaybeIgnoreError(&status);
     if (!status.ok()) {
       break;
     }
+
+    // 更新sn，注意sn和count也有关系
     const SequenceNumber last_seq =
         WriteBatchInternal::Sequence(&batch) +
         WriteBatchInternal::Count(&batch) - 1;
@@ -634,8 +666,10 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
     }
 
     if (mem->ApproximateMemoryUsage() > options_.write_buffer_size) {
+      // 如果需要生成level0的文件，那么就直接写到level0
       compactions++;
       *save_manifest = true;
+      // 注意：这里会有放掉锁的风险。
       status = WriteLevel0Table(mem, edit, nullptr);
       mem->Unref();
       mem = nullptr;
@@ -671,6 +705,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
     }
   }
 
+  // 最后都写入到level0里面
   if (mem != nullptr) {
     // mem did not get reused; compact it.
     if (status.ok()) {
@@ -1492,14 +1527,20 @@ Status DBImpl::Get(const ReadOptions& options,
                    std::string* value) {
   Status s;
   MutexLock l(&mutex_);
+
+  // 设置读的snapshot
   SequenceNumber snapshot;
   if (options.snapshot != nullptr) {
     snapshot =
         static_cast<const SnapshotImpl*>(options.snapshot)->sequence_number();
   } else {
+    // 如果传进来的参数里面没有snapshot
+    // 那么就取最大的序号
     snapshot = versions_->LastSequence();
   }
 
+  // 锁定需要的内存结构
+  // 后面在释放的时候，不会被别的模块释放掉
   MemTable* mem = mem_;
   MemTable* imm = imm_;
   Version* current = versions_->current();
@@ -2087,17 +2128,28 @@ Status DB::Delete(const WriteOptions& opt, const Slice& key) {
 
 DB::~DB() { }
 
+// 这里开始打开数据库
 Status DB::Open(const Options& options, const std::string& dbname,
                 DB** dbptr) {
   // db指针，一开始设置为空
+  // 注意这里传的是虚类的指针
   *dbptr = nullptr;
 
+  // 根据需要来决定具体的实现
   DBImpl* impl = new DBImpl(options, dbname);
+
+  // 先上锁
   impl->mutex_.Lock();
+
   VersionEdit edit;
+
   // Recover handles create_if_missing, error_if_exists
   bool save_manifest = false;
+
+  // NOTE: 这里代码比较绕，在Recover里面，如果发现数据库不存在
+  // 那么会想办法创建一个新的出来。
   Status s = impl->Recover(&edit, &save_manifest);
+
   if (s.ok() && impl->mem_ == nullptr) {
     // Create new log and a corresponding memtable.
     uint64_t new_log_number = impl->versions_->NewFileNumber();
@@ -2113,15 +2165,23 @@ Status DB::Open(const Options& options, const std::string& dbname,
       impl->mem_->Ref();
     }
   }
+
+  // 如果需要新建一个manifest
   if (s.ok() && save_manifest) {
+    // prev_log_number_在恢复之后就没有什么用了
     edit.SetPrevLogNumber(0);  // No older logs needed after recovery.
+    // 设置一个新的wal log序号
     edit.SetLogNumber(impl->logfile_number_);
+    // 把这个修改反应到version_set_上
     s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
   }
   if (s.ok()) {
     impl->DeleteObsoleteFiles();
+    // 由于level 0生成了一些文件，可能是需要触发compaction.
     impl->MaybeScheduleCompaction();
   }
+  // 为什么不在函数的最后再把锁释放了?
+  // 由于是在open函数里面。前面的文件锁，应该会把其他的thread open挡住
   impl->mutex_.Unlock();
   if (s.ok()) {
     assert(impl->mem_ != nullptr);
@@ -2135,6 +2195,7 @@ Status DB::Open(const Options& options, const std::string& dbname,
 Snapshot::~Snapshot() {
 }
 
+// 这里就是去清除各种文件
 Status DestroyDB(const std::string& dbname, const Options& options) {
   Env* env = options.env;
   std::vector<std::string> filenames;

@@ -1055,6 +1055,11 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   return s;
 }
 
+// 虽然名字叫Recover，注意与DBImple::Recover区别开来
+// 这里的Recover是for VersionSet的。
+// save_manifest是需要传回的参数，是说如果manifest开了写保护或者
+// options明确说明不能重用原来的manifest文件
+// 那么就在后面的步骤中需要新建一个manifest文件。
 Status VersionSet::Recover(bool *save_manifest) {
   //  报错用的代码，可以先不用管
   struct LogReporter : public log::Reader::Reporter {
@@ -1066,7 +1071,7 @@ Status VersionSet::Recover(bool *save_manifest) {
 
   // 从CURRENT文件中读取manifest的文件
   // Read "CURRENT" file, which contains a pointer to the current manifest file
-  std::string current;
+  std::string current/*current_file里面的内容，感觉名字叫current_file_content更好*/;
   Status s = ReadFileToString(env_, CurrentFileName(dbname_), &current);
   if (!s.ok()) {
     return s;
@@ -1083,7 +1088,7 @@ Status VersionSet::Recover(bool *save_manifest) {
   SequentialFile* file;
   // 打开manifest文件
   // WAL log_reader
-  s = env_->NewSequentialFile(dscname, &file);
+  s = env_->NewSequentialFile(dscname/*manifest_file_name*/, &file);
   if (!s.ok()) {
     if (s.IsNotFound()) {
       return Status::Corruption(
@@ -1092,10 +1097,16 @@ Status VersionSet::Recover(bool *save_manifest) {
     return s;
   }
 
+  // 是否有wal log?
   bool have_log_number = false;
+  // 是否有更早之前的wal log prev_number
   bool have_prev_log_number = false;
+  // 下一个文件号是多少?
   bool have_next_file = false;
+  // 是否有下一个SN
   bool have_last_sequence = false;
+
+  // 用来记录相应的信息
   uint64_t next_file = 0;
   uint64_t last_sequence = 0;
   uint64_t log_number = 0;
@@ -1104,20 +1115,33 @@ Status VersionSet::Recover(bool *save_manifest) {
   // 这里生成一个VersionEdit的Apply对象
   // 操作基础版本指向current_
   // 一个VersionEdit类似于个delta。
-  Builder builder(this, current_);
+  // build则是相当于那个加号
+  // SaveTo就相当于赋值到一个新的version.
+  Builder builder(this, current_/*以current为基础来进行累加*/);
+  // NOTE: 在builder中,构造函数current_->Ref(); 在析构函数中会进行current->Unref();
 
   {
+    // 出错处理用的，不管
     LogReporter reporter;
     reporter.status = &s;
+
     // log_reader.cc里面的WAL读者
     // 这里指向manifest文件
+    // 基实在leveldb里面，所有的initial_offset都是指向0的
+    // 这个完全就是一个多余的参数，可以直接去掉
     log::Reader reader(file, &reporter, true/*checksum*/, 0/*initial_offset*/);
+  
+    // 一个单个的record
     Slice record;
     std::string scratch;
     // 这里读取的是用户一次性存取的一个记录
     // 而不是WAL里面切分的record.
     // 这个记录是完整的
-    // scratch没有什么用。
+    // scratch的用途
+    // 由于读出一个完整的record，有时候，如果一个record被分成了好多部分。
+    // FRONT/MIDDLE.....MIDDLE/LAST
+    // 那么就需要一个内存把front/middle给缓存起来
+    // 当成生一个完整的record之后，再返回一个完整的record回来。
     while (reader.ReadRecord(&record, &scratch) && s.ok()) {
       // 利用decode取出VersionEdit
       VersionEdit edit;
@@ -1196,6 +1220,7 @@ Status VersionSet::Recover(bool *save_manifest) {
     //                     std::max(prev_log_number, log_number) + 1)
     MarkFileNumberUsed(prev_log_number);
     MarkFileNumberUsed(log_number);
+    // NOTE: 这里不再使用原来的log number.
   }
 
   // 当所有的VersionEdit都添加完毕之后
@@ -1220,9 +1245,13 @@ Status VersionSet::Recover(bool *save_manifest) {
     // 这里会根据option里面传进来的设定，以及各种限制
     // 比如文件size太大，新建不成功等等原因来决定。
     // See if we can reuse the existing MANIFEST file.
+    // 实际上这里就是对option做一定的检查，
+    // 然后尝试去打开旧有的manifest文件，看看是否可以做append
+    // 操作。如果失败，那么就返回false,说需要生成新的manifest文件
     if (ReuseManifest(dscname, current)) {
       // No need to save new manifest
     } else {
+      // 如果不能使用旧有的manifest文件，那么就需要另外再保存一下
       *save_manifest = true;
     }
   }
