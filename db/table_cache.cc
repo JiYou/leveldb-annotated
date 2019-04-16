@@ -113,8 +113,11 @@ Status TableCache::Get(const ReadOptions& options,
                        void* arg,
                        void (*saver)(void*, const Slice&, const Slice&)) {
   Cache::Handle* handle = nullptr;
+  // 去找到相应的file的句柄
   Status s = FindTable(file_number, file_size, &handle);
   if (s.ok()) {
+    // 通过文件的句柄，拿到hash的值
+    // hash的value部分是一个filemeta* & table
     Table* t = reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
     s = t->InternalGet(options, k, arg, saver);
     cache_->Release(handle);

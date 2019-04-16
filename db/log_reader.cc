@@ -92,8 +92,6 @@ bool Reader::SkipToInitialBlock() {
   //  block_start_location += kBlockSize;
   //}
 
-  std::cout << "block_start_location = " << block_start_location << std::endl;
-  std::cout << "initial_offset_ = " << initial_offset_ << std::endl;
 
   // (场景1): 当发生leftover == 6时，这个时候
   // block_start_location不会往前移动。那么后面在读的时候，仍然会从这个
@@ -137,8 +135,6 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
   Slice fragment;
   while (true) {
     const unsigned int record_type = ReadPhysicalRecord(&fragment);
-    std::cout << "--------BEGIN--------" << std::endl;
-    std::cout << "record_type = " << record_type  << " kBadType = " << kBadRecord << std::endl;
     // ReadPhysicalRecord may have only had an empty trailer remaining in its
     // internal buffer. Calculate the offset of the next physical record now
     // that it has returned, properly accounting for its header size.
@@ -155,30 +151,19 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
     // 实际上就是physical_record_offset自动跳过了这个bad record.
 
     // fragment.size() == 0
-    std::cout << "end_of_buffer_offset_ = " << end_of_buffer_offset_ << " - "
-              << "buffer_.size() = " << buffer_.size() << " - "
-              << "kHeaderSize = " << kHeaderSize << " - "
-              << "fragment.size() = " << fragment.size() << std::endl;
-    std::cout << "physical_record_offset = " << physical_record_offset << std::endl;
-
-    std::cout << "resyncing_ = " << resyncing_ << std::endl;
     if (resyncing_) {
       if (record_type == kMiddleType) {
-        std::cout << "record_type == kMiddleType; continue" << std::endl;
         continue;
       } else if (record_type == kLastType) {
-        std::cout << "record_type == kLastType; resyncing = false; continue" << std::endl;
         resyncing_ = false;
         continue;
       } else {
         resyncing_ = false;
-        std::cout << "else: resyncing_ = " << resyncing_ << std::endl;
       }
     }
 
     switch (record_type) {
       case kFullType:
-        std::cout << "case kFullType:" << std::endl;
         if (in_fragmented_record) {
           // Handle bug in earlier versions of log::Writer where
           // it could emit an empty kFirstType record at the tail end
@@ -196,7 +181,6 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
         return true;
 
       case kFirstType:
-        std::cout << "case kFirstType:" << std::endl;
         if (in_fragmented_record) {
           // Handle bug in earlier versions of log::Writer where
           // it could emit an empty kFirstType record at the tail end
@@ -212,7 +196,6 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
         break;
 
       case kMiddleType:
-        std::cout << "case kMiddleType:" << std::endl;
         if (!in_fragmented_record) {
           ReportCorruption(fragment.size(),
                            "missing start of fragmented record(1)");
@@ -222,9 +205,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
         break;
 
       case kLastType:
-        std::cout << "case kLastType:" << std::endl;
         if (!in_fragmented_record) {
-          std::cout << "ReportCorruption .... continue" << std::endl;
           ReportCorruption(fragment.size(),
                            "missing start of fragmented record(2)");
         } else {
@@ -236,7 +217,6 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
         break;
 
       case kEof:
-        std::cout << "case kEof:" << std::endl;
         if (in_fragmented_record) {
           // This can be caused by the writer dying immediately after
           // writing a physical record but before completing the next; don't
@@ -246,7 +226,6 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
         return false;
 
       case kBadRecord:
-        std::cout << "case kBadRecord:" << std::endl;
         // 注意kBadRecord会继续读
         if (in_fragmented_record) {
           ReportCorruption(scratch->size(), "error in middle of record");
@@ -256,7 +235,6 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
         break;
 
       default: {
-        std::cout << "case default:" << std::endl;
         char buf[40];
         snprintf(buf, sizeof(buf), "unknown record type %u", record_type);
         ReportCorruption(

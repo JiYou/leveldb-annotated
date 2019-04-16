@@ -93,8 +93,11 @@ int FindFile(const InternalKeyComparator& icmp,
   uint32_t right = files.size();
 
   // 原来的代码实在是太难看懂了，这里直接改成lower_bound二分搜
+  // 这里lower_boundr结果就是相当于把满足cmp()函数比较结果的都删除掉!
   return std::lower_bound(files.begin(), files.end(), key,
     [&icmp](const FileMetaData* f, const Slice &key) {
+      // NOTE1: 这里在查找的时候，只查找了上界
+      // NOTE2: 在比较的时候，除了比较user_key,还会比较sn序号
       return icmp.InternalKeyComparator::Compare(f->largest.Encode(), key) < 0;
     }) - files.begin();
 }
@@ -470,20 +473,27 @@ Status Version::Get(const ReadOptions& options,
         files = nullptr;
         num_files = 0;
       
-      // 如果找到了相应的
+      // 如果找到了相应的文件
       } else {
+        // 注意，这里的index是通过lower_bound找到的。
+        // 在通过lower_bound找的时候，只找到了上界
+        // 也就是根据文件的largest来进行了查找。
         tmp2 = files[index];
         if (ucmp->Compare(user_key, tmp2->smallest.user_key()) < 0) {
           // All of "tmp2" is past any data for user_key
           files = nullptr;
           num_files = 0;
         } else {
+          // 如果tmp2的下界比user_key小，那么说明要找的内容就在这个文件里面。
           files = &tmp2;
           num_files = 1;
         }
       }
     }
 
+    // NOTE: num_files的取值，如果是level 0，那么就是所有与user_key有overlap的文件
+    // 并且是按照刷写到level 0的新旧顺序进行了排序的
+    // 如果是其他level，那么往文件是只有一个的。
     for (uint32_t i = 0; i < num_files; ++i) {
       if (last_file_read != nullptr && stats->seek_file == nullptr) {
         // We have had more than one seek for this read.  Charge the 1st file.
@@ -500,9 +510,7 @@ Status Version::Get(const ReadOptions& options,
       saver.ucmp = ucmp;
       saver.user_key = user_key;
       saver.value = value;
-      // table cache 是文件的index cache部分
-      // 为什么只在table_cache里面搜?
-      // 这里可以看一下
+
       s = vset_->table_cache_->Get(options, f->number, f->file_size,
                                    ikey, &saver, SaveValue);
       if (!s.ok()) {
