@@ -37,6 +37,9 @@ namespace leveldb {
 
 class Arena;
 
+// 从操作上来说，这个skiplist是没有删除操作的。
+// 这里实际上有个隐含条件是说
+// Comparator需要有compare方法，并且可以比较
 template<typename Key, class Comparator>
 class SkipList {
  private:
@@ -175,15 +178,19 @@ struct SkipList<Key,Comparator>::Node {
   }
 
  private:
-  // Array of length equal to the node height.  next_[0] is lowest level link.
+  // Array of length equal to the node height. 
+  // next_[0] is lowest level link.
+  // 注意next_的类型
   port::AtomicPointer next_[1];
 };
 
 template<typename Key, class Comparator>
 typename SkipList<Key,Comparator>::Node*
 SkipList<Key,Comparator>::NewNode(const Key& key, int height) {
+  // 这里申请一段内存，然后利用这段内存来进行初始化
   char* mem = arena_->AllocateAligned(
       sizeof(Node) + sizeof(port::AtomicPointer) * (height - 1));
+  // placement new
   return new (mem) Node(key);
 }
 

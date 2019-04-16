@@ -185,12 +185,22 @@ class LookupKey {
   ~LookupKey();
 
   // Return a key suitable for lookup in a MemTable.
+  // memtable key就是把整个内存区域返回回去
+  // 实际上，在真正在skiplist进行比较的时候，
+  // 会去调用
+  // int MemTable::KeyComparator::operator()(const char* aptr, const char* bptr)
+  // 这个函数。
+  // 而这个函数： 会进一步调用GetLengthPrefixedSlice()，然后把key_data + sn取出来。
+  // 然后再进行比较。
+  // 所以最终在比较的时候，都是使用user_key + sn
   Slice memtable_key() const { return Slice(start_, end_ - start_); }
 
   // Return an internal key (suitable for passing to an internal iterator)
+  // internal key就是user_key + sn
   Slice internal_key() const { return Slice(kstart_, end_ - kstart_); }
 
   // Return the user key
+  // 这里是返回客户端用户传进来的key
   Slice user_key() const { return Slice(kstart_, end_ - kstart_ - 8); }
 
  private:

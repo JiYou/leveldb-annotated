@@ -61,7 +61,7 @@ inline char* Arena::Allocate(size_t bytes) {
   // The semantics of what to return are a bit messy if we allow
   // 0-byte allocations, so we disallow them here (we don't need
   // them for our internal use).
-  // 说这么多，实际上就是不允许只申请bytes > 0的情况
+  // 说这么多，实际上就是不能出现申请的bytes数小于等于0的情况
   assert(bytes > 0);
   // 如果当前块余下的空间还够用
   if (bytes <= alloc_bytes_remaining_) {
@@ -77,6 +77,11 @@ inline char* Arena::Allocate(size_t bytes) {
   // 如果要的bytes数目是大于1k，那么就申请bytes那么多。
   // 如果要的bytes数目小于1k，那么新申请的时候，就
   // 按照4k来申请，并且从里面扣.
+  // Fallback的意思是说退化，也就是退化成直接用new了。
+  // 如果内存只是比alloc_bytes_remaining_大一点点，那么就不用了。
+  // 直接去拿一块新的4KB，然后打散掉
+  // - 如果要的本来就是一块大的 >= 1KB，那么直接把这个大的挂在vector里面。然后就返回了。
+  // - 如果要的小于1KB，那么就申请一个4KB，然后开始切碎了返回之。
   return AllocateFallback(bytes);
 }
 

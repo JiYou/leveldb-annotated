@@ -117,16 +117,22 @@ void WriteBatch::Append(const WriteBatch &source) {
 }
 
 namespace {
+
+// 只是感觉这里很绕，本质上来说，就是直接把
 class MemTableInserter : public WriteBatch::Handler {
  public:
-  SequenceNumber sequence_;
-  MemTable* mem_;
+  SequenceNumber sequence_; // 这个sn来自于WriteBatch
+  MemTable* mem_;           // 其实就是调用skiplist.
 
+  // 由于WriteBatch里面只记录了record的第一个sn
+  // 所以需要根据count来进行sn递增
+  // 所以每个item都是有着唯的sn的。不会说几个item共享一个sn.
   virtual void Put(const Slice& key, const Slice& value) {
     mem_->Add(sequence_, kTypeValue, key, value);
     sequence_++;
   }
   virtual void Delete(const Slice& key) {
+    // 这里传的value就是一个空的Slice
     mem_->Add(sequence_, kTypeDeletion, key, Slice());
     sequence_++;
   }

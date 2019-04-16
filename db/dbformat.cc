@@ -47,6 +47,9 @@ const char* InternalKeyComparator::Name() const {
   return "leveldb.InternalKeyComparator";
 }
 
+// InternalKey实际上就是user_key + sn的形式
+// 所以当user_key相等的时候，那么就要开始比较
+// sn了。
 int InternalKeyComparator::Compare(const Slice& akey, const Slice& bkey) const {
   // Order by:
   //    increasing user key (according to user-supplied comparator)
@@ -118,9 +121,13 @@ bool InternalFilterPolicy::KeyMayMatch(const Slice& key, const Slice& f) const {
   return user_policy_->KeyMayMatch(ExtractUserKey(key), f);
 }
 
+// 形成的内存结构|key_len | key_data | (sn|type)
+// 注意 key_len是包含了 key_data + (sn|type)
 LookupKey::LookupKey(const Slice& user_key, SequenceNumber s) {
   size_t usize = user_key.size();
-  size_t needed = usize + 13;  // A conservative estimate
+  // A conservative estimate
+  // 一个保守的估计,(4+key_size+8)应该就可以了，这里相当于多了一个byte
+  size_t needed = usize + 13;
   char* dst;
   if (needed <= sizeof(space_)) {
     dst = space_;
@@ -128,6 +135,7 @@ LookupKey::LookupKey(const Slice& user_key, SequenceNumber s) {
     dst = new char[needed];
   }
   start_ = dst;
+  // key_len是包含了 key_data + (sn|type)
   dst = EncodeVarint32(dst, usize + 8);
   kstart_ = dst;
   memcpy(dst, user_key.data(), usize);

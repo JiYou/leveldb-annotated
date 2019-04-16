@@ -92,35 +92,11 @@ int FindFile(const InternalKeyComparator& icmp,
   uint32_t left = 0;
   uint32_t right = files.size();
 
-  std::cout << "\n\rfiles = ";
-  for (int i = 0; i < files.size(); i++) {
-    const FileMetaData* f = files[i];
-    const Slice p = f->largest.Encode();
-    const char *data = p.data();
-    std::string str(data, p.size());
-    std::cout << str << ", ";
-  }
-  std::cout << std::endl;
-
-  // 这里在用二分查找？
-  // 相当于是lower_bound
-  // 但是只用了largest值来进行比较
-  while (left < right) {
-    uint32_t mid = (left + right) / 2;
-    const FileMetaData* f = files[mid];
-    // 在c++ template编程里面
-    // lower_bound就是v > *mid时first = ++mid;
-    if (icmp.InternalKeyComparator::Compare(f->largest.Encode(), key) < 0) {
-      // Key at "mid.largest" is < "target".  Therefore all
-      // files at or before "mid" are uninteresting.
-      left = mid + 1;
-    } else {
-      // Key at "mid.largest" is >= "target".  Therefore all files
-      // after "mid" are uninteresting.
-      right = mid;
-    }
-  }
-  return left;
+  // 原来的代码实在是太难看懂了，这里直接改成lower_bound二分搜
+  return std::lower_bound(files.begin(), files.end(), key,
+    [&icmp](const FileMetaData* f, const Slice &key) {
+      return icmp.InternalKeyComparator::Compare(f->largest.Encode(), key) < 0;
+    }) - files.begin();
 }
 
 static bool AfterFile(const Comparator* ucmp,
@@ -426,8 +402,12 @@ Status Version::Get(const ReadOptions& options,
                     const LookupKey& k,
                     std::string* value,
                     GetStats* stats) {
+  // 这个时候ikey = user_key + sn
   Slice ikey = k.internal_key();
+  // 从internal key中提取出user_key
   Slice user_key = k.user_key();
+  // 这里使用的比较器就是 leveldb.BytewiseComparator
+  // 因为只是比较user key，所以只需要memcmp就可以了
   const Comparator* ucmp = vset_->icmp_.user_comparator();
   Status s;
 
@@ -436,39 +416,61 @@ Status Version::Get(const ReadOptions& options,
   FileMetaData* last_file_read = nullptr;
   int last_file_read_level = -1;
 
+  // 这里是说，越新的数据都是放在level数字比较小的level上。
+  // 如果在数字比较小的level上找到相应的key/val
+  // 那么这里就不再往高层的level去找了。
   // We can search level-by-level since entries never hop across
   // levels.  Therefore we are guaranteed that if we find data
   // in an smaller level, later levels are irrelevant.
   std::vector<FileMetaData*> tmp;
   FileMetaData* tmp2;
+  // 依次遍历每一层
   for (int level = 0; level < config::kNumLevels; level++) {
+    // 取得当前这一层的文件数
     size_t num_files = files_[level].size();
+    // 如果当前这一层没有文件，那么进入到下一层
     if (num_files == 0) continue;
 
     // Get the list of files to search in this level
+    // 从vector中取得data部分的指针
     FileMetaData* const* files = &files_[level][0];
     if (level == 0) {
       // Level-0 files may overlap each other.  Find all files that
       // overlap user_key and process them in order from newest to oldest.
+      // 预留空间
       tmp.reserve(num_files);
+      // 由于level里面的每个文件相互之间是有overlap的
+      // 所以，这里需要看一下每个文件，是否与要查找的key有overlap.
       for (uint32_t i = 0; i < num_files; i++) {
         FileMetaData* f = files[i];
+
+        // 如果存在overlap，那么把这个文件放到tmp中
         if (ucmp->Compare(user_key, f->smallest.user_key()) >= 0 &&
             ucmp->Compare(user_key, f->largest.user_key()) <= 0) {
           tmp.push_back(f);
         }
       }
+      // 如果level 0中没有与之overlap的文件
+      // 到下一层去搜索。
       if (tmp.empty()) continue;
 
+      // 如果LEVEL 0中有相应的文件
       std::sort(tmp.begin(), tmp.end(), NewestFirst);
+      // 那么files指针指向tmp vector的data部分
       files = &tmp[0];
+      // 找到的有overlap的文件个数
       num_files = tmp.size();
     } else {
       // Binary search to find earliest index whose largest key >= ikey.
+      // 这里是直接利用二分搜索在files_数组里面找到相应的位置
       uint32_t index = FindFile(vset_->icmp_, files_[level], ikey);
+      // 如果没有找到
+      // 感觉这里设计得不是特别好，应该直接利用iterator来做判断
       if (index >= num_files) {
         files = nullptr;
         num_files = 0;
+      
+      // 如果找到了相应的
       } else {
         tmp2 = files[index];
         if (ucmp->Compare(user_key, tmp2->smallest.user_key()) < 0) {
@@ -498,6 +500,9 @@ Status Version::Get(const ReadOptions& options,
       saver.ucmp = ucmp;
       saver.user_key = user_key;
       saver.value = value;
+      // table cache 是文件的index cache部分
+      // 为什么只在table_cache里面搜?
+      // 这里可以看一下
       s = vset_->table_cache_->Get(options, f->number, f->file_size,
                                    ikey, &saver, SaveValue);
       if (!s.ok()) {

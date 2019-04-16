@@ -20,7 +20,12 @@ Arena::~Arena() {
   }
 }
 
+// Arena::AllocateFallback的意思说，当Arena里面余下的内存不够的时候
+// 就从系统的内存里面再申请一些内存
+// 相当于退化成了New
 char* Arena::AllocateFallback(size_t bytes) {
+  // 当要申请的内存数量大于4KB
+  // 那么直接拿了然后返回回去
   if (bytes > kBlockSize / 4) {
     // Object is more than a quarter of our block size.  Allocate it separately
     // to avoid wasting too much space in leftover bytes.
@@ -28,6 +33,8 @@ char* Arena::AllocateFallback(size_t bytes) {
     return result;
   }
 
+  // 如果是小块的内存，也就是小于1kb的。那么申请一个大块4KB，然后
+  // 从这一大块中扣一小块返回回去
   // We waste the remaining space in the current block.
   alloc_ptr_ = AllocateNewBlock(kBlockSize);
   alloc_bytes_remaining_ = kBlockSize;
@@ -50,11 +57,13 @@ char* Arena::AllocateAligned(size_t bytes) {
   // 但是当前指针指向的是0x017这里。
   // 那么余下的current_mod就是1
   size_t current_mod = reinterpret_cast<uintptr_t>(alloc_ptr_) & (align-1);
-  // 如果当前地址是0x17, 要求对齐是8 bytes
-  // 那么current_mod = 1, slop 就是7
+  // 注意，这里取地址的时候，由于只能向前走。
+  // 假设地址是0x07。并且对齐的时候，要求是8bytes对齐。那么
+  // 当前的地址只能是再向前走一个byte才可以对齐。
+  // 所以这里的slop就是计算出需要向前走的长度。
   size_t slop = (current_mod == 0 ? 0 : align - current_mod);
   // bytes + slop，
-  // 就是把余下的这个slop = 7算在新的申请者头上
+  // 就是把余下的这个slop算在新的申请者头上
   // 返回的时候，直接向前移动slop个bytes
   // 就完成了对齐。
   size_t needed = bytes + slop;
@@ -73,6 +82,9 @@ char* Arena::AllocateAligned(size_t bytes) {
     result = AllocateFallback(bytes);
   }
   // 这里断言一下，返回地址result肯定是对齐的。
+  // 这里比较有意思的是，AllocateFallback()函数里面要的都是
+  // 4KB，并且是直接使用new来操作的。那么可以认为拿到的内存本来就是
+  // 已经对齐的。
   assert((reinterpret_cast<uintptr_t>(result) & (align-1)) == 0);
   return result;
 }

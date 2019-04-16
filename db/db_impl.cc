@@ -1526,7 +1526,7 @@ Status DBImpl::Get(const ReadOptions& options,
                    const Slice& key,
                    std::string* value) {
   Status s;
-  MutexLock l(&mutex_);
+  MutexLock l(&mutex_);  // 这里一开始就去拿到锁
 
   // 设置读的snapshot
   SequenceNumber snapshot;
@@ -1540,11 +1540,17 @@ Status DBImpl::Get(const ReadOptions& options,
   }
 
   // 锁定需要的内存结构
-  // 后面在释放的时候，不会被别的模块释放掉
+  // 后面在释放的时候，不会被别的模块释放
   MemTable* mem = mem_;
   MemTable* imm = imm_;
   Version* current = versions_->current();
   mem->Ref();
+  // 这里可以思考一下。如果在使用的时候，compaction也在使用imm_应该怎么办？
+  // 真正在实现的过程中，由于compaction完成之后，会调用UnRef()函数
+  // 谁是最后一个UnRef()的，那么就由谁来释放内存。
+  // 所以这里不需要内存的争用问题
+  // 但是，由于imm_ mem_里面的变量的引用计数都不是原子类型，都是需要在拿到锁的时候
+  // 才可以进行的操作，所以这里需要在拿到锁的时候才可以Ref()/UnRef()
   if (imm != nullptr) imm->Ref();
   current->Ref();
 
@@ -1552,15 +1558,35 @@ Status DBImpl::Get(const ReadOptions& options,
   Version::GetStats stats;
 
   // Unlock while reading from files and memtables
+  // NOTE: 在设计的时候，skiplist被设计成多读一写。也就是说支持多个线程同时读
+  // 但是同一时刻只能有一个线程写，主要的原因是因为，skiplist不会删除原来的节点
+  // 也不会修改原来的节点。
   {
     mutex_.Unlock();
     // First look in the memtable, then in the immutable memtable (if any).
+    // LookupKey主要由三个部分
+    // - start  key_len part
+    // - kstart key_data part
+    // - end sn/seq uint64_t
+
+    // 在skiplist中查找到的时候，会用到start-end
+    // 在sst中查找的时候，只会用到kstart - end
+    // Q: 这里放进去的sn是当前全局最大的sn
+    // 寻么在查找的时候，就需要看一下如何利用这个sn
+    // 找到最新的key
     LookupKey lkey(key, snapshot);
+
+    // 三段击
+    // 先在mem中找
+    // 再在imm_中找
+    // 单纯从代码来说，mem_与imm_是同样的数据结构。
+    // 最后在current version中找，实际上就是在磁盘中找了
     if (mem->Get(lkey, value, &s)) {
       // Done
     } else if (imm != nullptr && imm->Get(lkey, value, &s)) {
       // Done
     } else {
+      // 这里在查的时候，是基于current version
       s = current->Get(options, lkey, value, &stats);
       have_stat_update = true;
     }
@@ -1614,6 +1640,13 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
   return DB::Delete(options, key);
 }
 
+/* 简化地总结一下写入的流程：
+ * - 放到Queue中
+ * - MakeRoomForWrite()
+ * - 打包所有的写入请求
+ * - 写入到wal log里面
+ * - 写入到MEM_里面
+ */
 // 如果是从put函数过来。那么在DBImpl::Put那边。
 // my_batch那头就是一个局部变量
 // 当Write调用完之后那边释放
@@ -1678,6 +1711,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
     // 注意，只有当前的这个线程是拿到锁的，所以
     WriteBatchInternal::SetSequence(updates, last_sequence + 1);
     // 注意，批量的写入之后，last_sn += count
+    // Q: 中间的sn还用不用?
     last_sequence += WriteBatchInternal::Count(updates);
 
     // 接下来要把要写入的item追加到wal log并且更新到memtable.
