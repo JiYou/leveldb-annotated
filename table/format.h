@@ -17,6 +17,9 @@ class Block;
 class RandomAccessFile;
 struct ReadOptions;
 
+// BlockHandle就是相当于一个指针，指出data block或者meta block在文件
+// 中偏移的位置
+// 主要就是依据offset和size
 // BlockHandle is a pointer to the extent of a file that stores a data
 // block or a meta block.
 class BlockHandle {
@@ -38,11 +41,31 @@ class BlockHandle {
   enum { kMaxEncodedLength = 10 + 10 };
 
  private:
-  uint64_t offset_;
+  uint64_t offset_; // 注意unsigned类型
   uint64_t size_;
 };
 
-// Footer encapsulates the fixed information stored at the tail
+// Footer是一个sst文件的最后的那一部分
+// 写入到文件中之后，整个长度就是48 bytes.
+// 这里只是在内存中的结构
+// 由于写入到文件中的部分是经过编码了。
+// 但是在内存中是没有这个必要的。
+// Footer实际上就只是记录了两部分的信息
+// - meta block index
+// - data block index
+// 这里可以把sst文件认为是三级页表
+// Footer是页表的入口.
+// - 一级页表
+//   meta block index
+//   data block index
+// - 二级页表
+//   meta index
+//   block index
+// - 三级
+//   meta data
+//   block data
+// Footer encapsulates the
+// fixed information stored at the tail
 // end of every table file.
 class Footer {
  public:
@@ -56,6 +79,7 @@ class Footer {
   const BlockHandle& index_handle() const {
     return index_handle_;
   }
+
   void set_index_handle(const BlockHandle& h) {
     index_handle_ = h;
   }
@@ -75,15 +99,19 @@ class Footer {
   BlockHandle index_handle_;
 };
 
+// MagicNumber会被写入到Footer中.
 // kTableMagicNumber was picked by running
 //    echo http://code.google.com/p/leveldb/ | sha1sum
 // and taking the leading 64 bits.
 static const uint64_t kTableMagicNumber = 0xdb4775248b80fb57ull;
 
+// 每个Block尾部的长度
+// 一个byte表示类型，4个byte表示crc32
 // 1-byte type + 32-bit crc
 static const size_t kBlockTrailerSize = 5;
 
 // 读取整个block cache
+// 实际上就是一段裸数据
 struct BlockContents {
   Slice data;           // Actual contents of data
   bool cachable;        // True iff data can be cached
@@ -99,6 +127,7 @@ Status ReadBlock(RandomAccessFile* file,
 
 // Implementation details follow.  Clients should ignore,
 
+// 在默认情况下，直接两个数都取到了最大值
 inline BlockHandle::BlockHandle()
     : offset_(~static_cast<uint64_t>(0)),
       size_(~static_cast<uint64_t>(0)) {

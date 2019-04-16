@@ -47,6 +47,7 @@ struct Table::Rep {
   Block* index_block;
 };
 
+// 读取sst文件
 // 工厂类，这里将table传进来，然后将结果放到table里面传回去。
 // 总结一下：open的时候，只会把data block index和meta block读出来。
 // 这是因为data block index里面存有key的信息，可以直接用来进行检索
@@ -71,6 +72,7 @@ Status Table::Open(const Options& options,
   // 如果size足够，那么开始把footer读出来
   char footer_space[Footer::kEncodedLength];
   Slice footer_input;
+  // 1. 读取footer，消费一个IOPS
   Status s = file->Read(size - Footer::kEncodedLength, Footer::kEncodedLength,
                         &footer_input, footer_space);
   if (!s.ok()) return s;
@@ -92,6 +94,9 @@ Status Table::Open(const Options& options,
     // 这里只是把内容从文件中移到
     // index_block_contents
     // 这段内存里面
+    // 消费第二个IOPS
+    // 并且从代码看来，这个文件在打开的时候，应该是使用了cache的。
+    // 也就是说，没有使用O_DIRECT的方式来打开。
     s = ReadBlock(file, opt, footer.index_handle(), &index_block_contents);
   }
 
@@ -152,6 +157,8 @@ void Table::ReadMeta(const Footer& footer) {
   // | crc32 4 byte              |
   Block* meta = new Block(contents);
 
+  // 这里直接就指定了compare?
+  // 这里可能是先随意设置一个，在ReadFilter函数里面会把这个给改掉
   Iterator* iter = meta->NewIterator(BytewiseComparator());
 
   // 这里生成filter的名字
@@ -233,6 +240,8 @@ static void ReleaseBlock(void* arg, void* h) {
   cache->Release(handle);
 }
 
+// 这里是把一个编码过的BlockHandle指向的data block里面的data(key/value)部分
+// 读出来
 // Convert an index iterator value (i.e., an encoded BlockHandle)
 // into an iterator over the contents of the corresponding block.
 Iterator* Table::BlockReader(void* arg,
@@ -241,14 +250,15 @@ Iterator* Table::BlockReader(void* arg,
   // arg就是table，那么为什么不直接命名为Table *arg
   // 这里是为了添加到cache的时候方便
   Table* table = reinterpret_cast<Table*>(arg);
+  // block_cache指的就是对sst文件中的data block部分的cache
   Cache* block_cache = table->rep_->options.block_cache;
   Block* block = nullptr;
   Cache::Handle* cache_handle = nullptr;
 
   // 取出offset/size
   BlockHandle handle;
-  Slice input = index_value;
-  Status s = handle.DecodeFrom(&input);
+  Slice input = index_value; // 虽然在内存里面，但是扔然是编码过的
+  Status s = handle.DecodeFrom(&input); // 解码成能用的格式
   // We intentionally allow extra stuff in index_value so that we
   // can add more features in the future.
 
@@ -262,7 +272,10 @@ Iterator* Table::BlockReader(void* arg,
       // 如果是把cache当成一个map<cache_key, value>
       // 那么cache_key_buffer就是前面的key
       // value就是相应的block指针
+
+      // 注意block cache里面索引的生成方式
       char cache_key_buffer[16];
+      // 当前table是有一个id的。
       EncodeFixed64(cache_key_buffer, table->rep_->cache_id);
       EncodeFixed64(cache_key_buffer+8, handle.offset());
       
@@ -271,13 +284,27 @@ Iterator* Table::BlockReader(void* arg,
       //   a. 找到，那么直接返回
       //   b. 没有找到，那么就从文件中读取相应的block到contents里面。
       Slice key(cache_key_buffer, sizeof(cache_key_buffer));
+
+      // 看一下是否已经在block cache里面了。
       cache_handle = block_cache->Lookup(key);
       if (cache_handle != nullptr) {
+        // 如果能够找到
+        // return reinterpret_cast<LRUHandle*>(handle)->value;
+        // 其实这里value部分就是一个Block*
+        // cache.cc:695   virtual void* Value(Handle* handle) {
+        //           return reinterpret_cast<LRUHandle*>(handle)->value;
+        //       }
         block = reinterpret_cast<Block*>(block_cache->Value(cache_handle));
       } else {
+        // 如果没有在table cache中找到
+        // 那么读到contents里面
+        // contents就是一段内存
         s = ReadBlock(table->rep_->file, options, handle, &contents);
         if (s.ok()) {
+          // 利用contents这段内存来生成block.
+          // 注意：内存仍然是共享的
           block = new Block(contents);
+          // 如果是需要加到cache中。
           if (contents.cachable && options.fill_cache) {
             cache_handle = block_cache->Insert(
                 key, block, block->size(), &DeleteCachedBlock);
@@ -298,6 +325,7 @@ Iterator* Table::BlockReader(void* arg,
   if (block != nullptr) {
     // 这里生成相应的Iterator，并且会注册删除时的回调函数
     iter = block->NewIterator(table->rep_->options.comparator);
+    // cache_handle是cache中的句柄
     if (cache_handle == nullptr) {
       // 所有的Iterator都可以注册这个回调函数，在退出的时候，自动执行清理工作。
       iter->RegisterCleanup(&DeleteBlock, block, nullptr);

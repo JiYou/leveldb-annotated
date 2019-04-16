@@ -19,6 +19,7 @@ class RandomAccessFile;
 struct ReadOptions;
 class TableCache;
 
+// Table类就是一个sst文件的内存表示
 // A Table is a sorted map from strings to strings.  Tables are
 // immutable and persistent.  A Table may be safely accessed from
 // multiple threads without external synchronization.
@@ -36,6 +37,7 @@ class LEVELDB_EXPORT Table {
   // for the duration of the returned table's lifetime.
   //
   // *file must remain live while this Table is in use.
+  // 如何打开一个sst文件
   static Status Open(const Options& options,
                      RandomAccessFile* file,
                      uint64_t file_size,
