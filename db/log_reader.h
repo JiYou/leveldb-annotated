@@ -102,14 +102,15 @@ class Reader {
   // 因为后面的代码，只在kFullType和kFirstType的时候才会记录这个值
   uint64_t last_record_offset_;
 
-  // buffer_里面的offset
-  // 注意end_of_所以，end_of_buffer_offset_指向的是
-  // 物理位置上的buffer_对应的block的尾部。
-  // 即buffer_end位置在文件中的的offset
+  // 前面不是有个buffer_变量么？buffer_的尾巴与backing_store_的尾巴实际上是对齐的。
+  // 因为操作流程如下：
+  // 1. 从文件中读一个32KB出来到backing_store_中。
+  // 2. 然后利用出来的内存空间backing_store_构建buffer_这个slice
+  // 3. slice从头开始不断地吐出record
+  // 4. buffer's end 's offset_ 指的就是backing_store_的尾巴的offset
+  //    也就是下一次要读backing_store_的开始处。可以想象，应该是32KB对齐的。
   // Offset of the first location past the end of buffer_.
   uint64_t end_of_buffer_offset_;
-
-  bool resyncing_;
 
   // Extend record types with the following special values
   enum {

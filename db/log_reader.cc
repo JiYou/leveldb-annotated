@@ -11,13 +11,6 @@
 #include "util/crc32c.h"
 
 /*
- * 总结一下读者的行为
- * 1. 跳过initial_offset_的block
- * 2. 跳过initial_offset_的record
- * 3. 然后一个一个record读出来。如果是{kFirstType, kMiddleType, kLastType}
- *    就把record都读出来，然后组装到scratch里面
- *    如果是kFullType，那么就只把结果放到record参数中，而不放到scratch中
- *
  * 读record的步骤
  * a. 先把数据读到backing_store_里面
  * b. 利用backing_store_构建buffer_
@@ -34,15 +27,18 @@ Reader::Reporter::~Reporter() {}
 
 Reader::Reader(SequentialFile* file, Reporter* reporter, bool checksum)
     : file_(file),
-      reporter_(reporter),
-      checksum_(checksum),
-      // 一个block的memory buffer.
+      reporter_(reporter),  // 报错器，不用管
+      checksum_(checksum),  // 是否需要对record进行校验
+      // 一个block的memory buffer. 32KB
+      // 因为写入的时候是按照32KB来进行编码的
       backing_store_(new char[kBlockSize]),
+      // buffer_是一个slice，在backing_store_这个Block大小的内存区间里面移动。
       buffer_(),
+      // 是否读到了文件尾?
       eof_(false),
+      // 最后一个record的偏移
       last_record_offset_(0),
-      end_of_buffer_offset_(0),
-      resyncing_(false) {}
+      end_of_buffer_offset_(0) {}
 
 Reader::~Reader() { delete[] backing_store_; }
 
@@ -74,19 +70,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
         end_of_buffer_offset_ - buffer_.size() - kHeaderSize - fragment.size();
     // 注意: 如果record_type == kBadRecord
     // 那么fragment.size() == 0
-    // 实际上就是physical_record_offset自动跳过了这个bad record.
-
-    // fragment.size() == 0
-    if (resyncing_) {
-      if (record_type == kMiddleType) {
-        continue;
-      } else if (record_type == kLastType) {
-        resyncing_ = false;
-        continue;
-      } else {
-        resyncing_ = false;
-      }
-    }
+    // 实际上就是physical_record_offset自动跳过了这个bad record
 
     switch (record_type) {
       case kFullType:
