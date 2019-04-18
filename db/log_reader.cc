@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#include <iostream>
 #include "db/log_reader.h"
+#include <iostream>
 
 #include <stdio.h>
 #include "leveldb/env.h"
@@ -17,7 +17,7 @@
  * 3. 然后一个一个record读出来。如果是{kFirstType, kMiddleType, kLastType}
  *    就把record都读出来，然后组装到scratch里面
  *    如果是kFullType，那么就只把结果放到record参数中，而不放到scratch中
- * 
+ *
  * 读record的步骤
  * a. 先把数据读到backing_store_里面
  * b. 利用backing_store_构建buffer_
@@ -30,11 +30,9 @@
 namespace leveldb {
 namespace log {
 
-Reader::Reporter::~Reporter() {
-}
+Reader::Reporter::~Reporter() {}
 
-Reader::Reader(SequentialFile* file, Reporter* reporter, bool checksum,
-               uint64_t initial_offset)
+Reader::Reader(SequentialFile* file, Reporter* reporter, bool checksum)
     : file_(file),
       reporter_(reporter),
       checksum_(checksum),
@@ -44,83 +42,11 @@ Reader::Reader(SequentialFile* file, Reporter* reporter, bool checksum,
       eof_(false),
       last_record_offset_(0),
       end_of_buffer_offset_(0),
-      initial_offset_(initial_offset),
-      resyncing_(initial_offset > 0) {
-}
+      resyncing_(false) {}
 
-Reader::~Reader() {
-  delete[] backing_store_;
-}
-
-// Q 1. 如果initial_offset_为0，但是file给的时候，current位置不在
-//      边界上应该怎么办？
-//   应该是要求必须要求current pos在32KB上已经是对齐的。否则后面根据
-//      initial_offset_来跳跃就没有意义。
-// Q 2. initial_offset_不为0时是怎么处理的？
-//
-// 场景1： SkipToInitialBlock()中
-//   const int leftover = kBlockSize - offset_in_block;
-//   如果leftover == 6会发生什么？
-
-bool Reader::SkipToInitialBlock() {
-  // 
-  const size_t offset_in_block = initial_offset_ % kBlockSize;
-  uint64_t block_start_location = initial_offset_ - offset_in_block;
-
-  // Don't search a block if we'd be in the trailer
-  // 如果发现文件指针落在这个7bytes的尾巴上，那么直接跳过这个block
-  // -6, -5, -4, -3, -2, -1
-  // 这里代码写成：
-  const int leftover = kBlockSize - offset_in_block;
-  // 这里不能用<=
-  if (leftover < kHeaderSize) {
-    block_start_location += kBlockSize;
-  }
-  // 更加清晰明了
-  // 实际上，这里如果是<=应该也都是可以跳过的?
-  // leftover == 7是否需要跳过?
-  // 1. 假设取== kHeaderSize的时候被跳过了
-  //    那么万一前面一个block在写的时候，刚到余下7个btyes
-  //    这个时候会放一个kFirstType 7byte，但是没有用户数据
-  //    下一个block开始放kMiddleType
-  //    如果跳过了，那么在读下一个block的时候，开始就读到
-  //    kMiddleType, 接着会把整个用户数据跳过。
-  // 如果按照原来作者这里的思路，当leftover == 6的时候
-  // 也不跳，那么意味着会把相应的这个读出来。
-
-  //if (offset_in_block > kBlockSize - 6) {
-  //  block_start_location += kBlockSize;
-  //}
-
-
-  // (场景1): 当发生leftover == 6时，这个时候
-  // block_start_location不会往前移动。那么后面在读的时候，仍然会从这个
-  // 需要被跳过的block开始读。
-  // offset_in_block则指向这个block的tailer部分。
-
-  // 假设有一段内存区域0是与整个文件的current_pos_是对齐的。
-  end_of_buffer_offset_ = block_start_location;
-
-  // Skip to start of first block that can contain the initial record
-  if (block_start_location > 0) {
-    Status skip_status = file_->Skip(block_start_location);
-    if (!skip_status.ok()) {
-      ReportDrop(block_start_location, skip_status);
-      return false;
-    }
-  }
-
-  return true;
-}
+Reader::~Reader() { delete[] backing_store_; }
 
 bool Reader::ReadRecord(Slice* record, std::string* scratch) {
-  // 一开始是0，当然要跳过了
-  if (last_record_offset_ < initial_offset_) {
-    if (!SkipToInitialBlock()) {
-      return false;
-    }
-  }
-
   // 用户传进来的内存区域
   scratch->clear();
   record->clear();
@@ -249,9 +175,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
   return false;
 }
 
-uint64_t Reader::LastRecordOffset() {
-  return last_record_offset_;
-}
+uint64_t Reader::LastRecordOffset() { return last_record_offset_; }
 
 void Reader::ReportCorruption(uint64_t bytes, const char* reason) {
   ReportDrop(bytes, Status::Corruption(reason));
@@ -259,7 +183,7 @@ void Reader::ReportCorruption(uint64_t bytes, const char* reason) {
 
 void Reader::ReportDrop(uint64_t bytes, const Status& reason) {
   if (reporter_ != nullptr &&
-      end_of_buffer_offset_ - buffer_.size() - bytes >= initial_offset_) {
+      end_of_buffer_offset_ - buffer_.size() - bytes >= 0) {
     reporter_->Corruption(static_cast<size_t>(bytes), reason);
   }
 }
@@ -361,8 +285,7 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result) {
     // 得到的就是一个record的开头位置。
     // 如果这个record的起始位置小于initial_offset_
     // 那么直接跳过
-    if (end_of_buffer_offset_ - buffer_.size() - kHeaderSize - length <
-        initial_offset_) {
+    if (end_of_buffer_offset_ - buffer_.size() - kHeaderSize - length < 0) {
       result->clear();
       return kBadRecord;
     }

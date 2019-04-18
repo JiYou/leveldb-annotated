@@ -38,6 +38,7 @@ class LEVELDB_EXPORT Table {
   //
   // *file must remain live while this Table is in use.
   // 如何打开一个sst文件
+  // 统一的工厂类
   static Status Open(const Options& options,
                      RandomAccessFile* file,
                      uint64_t file_size,
@@ -62,7 +63,7 @@ class LEVELDB_EXPORT Table {
   uint64_t ApproximateOffsetOf(const Slice& key) const;
 
  private:
-  struct Rep;
+  struct Rep; // 具体的定义并不在这里，所以下面就只能是使用一个指针
   Rep* rep_;
 
   explicit Table(Rep* rep) { rep_ = rep; }

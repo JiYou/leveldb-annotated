@@ -118,6 +118,14 @@ struct BlockContents {
   bool heap_allocated;  // True iff caller should delete[] data.data()
 };
 
+// 从本质上来说，实际上BlockHandle就是一段offset & size
+// 这个函数只需要把文件相应的offset & size读取BlockContents里面就可以了。
+
+// 可能用来读取的对象包括
+// - data block index
+// - meta block index
+// - data block
+// - meta block
 // Read the block identified by "handle" from "file".  On failure
 // return non-OK.  On success fill *result and return OK.
 Status ReadBlock(RandomAccessFile* file,

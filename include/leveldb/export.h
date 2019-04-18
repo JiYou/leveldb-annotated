@@ -5,6 +5,9 @@
 #ifndef STORAGE_LEVELDB_INCLUDE_EXPORT_H_
 #define STORAGE_LEVELDB_INCLUDE_EXPORT_H_
 
+// 这个文件的定义其实主要是为了支持windows
+// DLL的定义而进行的扩展，没有什么用，可以不用看。
+
 #if !defined(LEVELDB_EXPORT)
 
 #if defined(LEVELDB_SHARED_LIBRARY)

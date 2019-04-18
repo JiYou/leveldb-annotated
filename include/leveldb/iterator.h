@@ -21,6 +21,7 @@
 
 namespace leveldb {
 
+// leveldb统一视角上的iterator
 class LEVELDB_EXPORT Iterator {
  public:
   Iterator();
@@ -30,14 +31,17 @@ class LEVELDB_EXPORT Iterator {
 
   virtual ~Iterator();
 
+  // 当前的iterator是否有效
   // An iterator is either positioned at a key/value pair, or
   // not valid.  This method returns true iff the iterator is valid.
   virtual bool Valid() const = 0;
 
+  // 移动到第一个key
   // Position at the first key in the source.  The iterator is Valid()
   // after this call iff the source is not empty.
   virtual void SeekToFirst() = 0;
 
+  // 移动到最后一个key
   // Position at the last key in the source.  The iterator is
   // Valid() after this call iff the source is not empty.
   virtual void SeekToLast() = 0;
@@ -45,6 +49,9 @@ class LEVELDB_EXPORT Iterator {
   // Position at the first key in the source that is at or past target.
   // The iterator is Valid() after this call iff the source contains
   // an entry that comes at or past target.
+  // 相当于std::lower_bound
+  // [1,2,2,2,2,4] < find 2 反回第一个2的位置
+  // 如果要找到的是3那么这里会返回4
   virtual void Seek(const Slice& target) = 0;
 
   // Moves to the next entry in the source.  After this call, Valid() is
@@ -70,6 +77,7 @@ class LEVELDB_EXPORT Iterator {
   virtual Slice value() const = 0;
 
   // If an error has occurred, return it.  Else return an ok status.
+  // 查看当前iterator有效性
   virtual Status status() const = 0;
 
   // Clients are allowed to register function/arg1/arg2 triples that
@@ -93,8 +101,12 @@ class LEVELDB_EXPORT Iterator {
     // True if the node is not used. Only head nodes might be unused.
     bool IsEmpty() const { return function == nullptr; }
     // Invokes the cleanup function.
-    void Run() { assert(function != nullptr); (*function)(arg1, arg2); }
+    void Run() {
+      assert(function != nullptr);
+      (*function)(arg1, arg2);
+    }
   };
+  // 形成一个链表
   CleanupNode cleanup_head_;
 };
 

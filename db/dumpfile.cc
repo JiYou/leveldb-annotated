@@ -60,7 +60,7 @@ Status PrintLogContents(Env* env, const std::string& fname,
   }
   CorruptionReporter reporter;
   reporter.dst_ = dst;
-  log::Reader reader(file, &reporter, true, 0);
+  log::Reader reader(file, &reporter, true);
   Slice record;
   std::string scratch;
   while (reader.ReadRecord(&record, &scratch)) {
@@ -89,7 +89,6 @@ class WriteBatchItemPrinter : public WriteBatch::Handler {
     dst_->Append(r);
   }
 };
-
 
 // Called on every log record (each one of which is a WriteBatch)
 // found in a kLogFile.
@@ -216,9 +215,12 @@ Status DumpFile(Env* env, const std::string& fname, WritableFile* dst) {
     return Status::InvalidArgument(fname + ": unknown file type");
   }
   switch (ftype) {
-    case kLogFile:         return DumpLog(env, fname, dst);
-    case kDescriptorFile:  return DumpDescriptor(env, fname, dst);
-    case kTableFile:       return DumpTable(env, fname, dst);
+    case kLogFile:
+      return DumpLog(env, fname, dst);
+    case kDescriptorFile:
+      return DumpDescriptor(env, fname, dst);
+    case kTableFile:
+      return DumpTable(env, fname, dst);
     default:
       break;
   }

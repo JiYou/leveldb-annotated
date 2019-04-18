@@ -91,10 +91,10 @@ Status Footer::DecodeFrom(Slice* input) {
 // 把这个内存传递给Block
 // 如果Block发现这个内存是需要自己释放的
 // 那么在Block的析构函数里面就释放掉了
-Status ReadBlock(RandomAccessFile* file,
-                 const ReadOptions& options,
-                 const BlockHandle& handle,
-                 BlockContents* result) {
+Status ReadBlock(RandomAccessFile* file,     // 随机访问文件
+                 const ReadOptions& options, // 读选项
+                 const BlockHandle& handle,  // 指向要读取的数据的位置
+                 BlockContents* result) {    // 读到哪里去
   // 清空掉原来的result.
   result->data = Slice();
   // 默认不cache
@@ -117,6 +117,7 @@ Status ReadBlock(RandomAccessFile* file,
   // 读出来，放到contents里面
   // 真正的读取操作，对于posiz而言，则是在
   // env_posix.cc  virtual Status Read(uint64_t offset, size_t n, Slice* result,
+  // 这里直接调用了pread/pwrite
   Status s = file->Read(handle.offset(), n + kBlockTrailerSize, &contents, buf);
   if (!s.ok()) {
     delete[] buf;

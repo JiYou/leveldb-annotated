@@ -18,6 +18,11 @@
 namespace leveldb {
 
 // Table类主要是完成读取工作
+// 这里面是真正存放东西的地方
+// 只会处理下面两样
+// - meta data 实际上就是filter
+// - data block index
+
 struct Table::Rep {
   ~Rep() {
     // 释放filter读者即FilterBlockReader
@@ -34,14 +39,18 @@ struct Table::Rep {
   // 随机访问的文件
   RandomAccessFile* file;
   // 缓存中的id?
+  // 主要是用在LRUCache里
   uint64_t cache_id;
-  // filter block的读者
+  // filter block的读者(或者叫读取器更合适)
   // 按照filter block的格式将filter读出来
   FilterBlockReader* filter;
   // filter需要使用到的数据
+  // 也就是filter在内存中的二进制表示
   const char* filter_data;
 
   // meta block index handle
+  // meta block index index实际上就是Footer里面的那个
+  // meta_block_index_handle
   BlockHandle metaindex_handle;  // Handle to metaindex_block: saved from footer
   // data block index
   Block* index_block;
@@ -51,6 +60,7 @@ struct Table::Rep {
 // 工厂类，这里将table传进来，然后将结果放到table里面传回去。
 // 总结一下：open的时候，只会把data block index和meta block读出来。
 // 这是因为data block index里面存有key的信息，可以直接用来进行检索
+// 但是并不是所有的key都在里面。
 // meta block index里面只有一个filter.name和offset/size
 // 存放meta block index是没有什么意义的。
 // 所以为了简便起见，也是为了压缩内存
@@ -97,6 +107,7 @@ Status Table::Open(const Options& options,
     // 消费第二个IOPS
     // 并且从代码看来，这个文件在打开的时候，应该是使用了cache的。
     // 也就是说，没有使用O_DIRECT的方式来打开。
+    // footer.index_handle()指向的是data block index的offset & size.
     s = ReadBlock(file, opt, footer.index_handle(), &index_block_contents);
   }
 
@@ -108,6 +119,7 @@ Status Table::Open(const Options& options,
     // 所以除去footer之外，这里data block index是一个生成的块
     Block* index_block = new Block(index_block_contents);
     // 生成好之后，这里开始设置rep
+    // 相当于工厂类，需要在这里进行生成和处理
     Rep* rep = new Table::Rep;
     rep->options = options;
     rep->file = file;
@@ -116,6 +128,7 @@ Status Table::Open(const Options& options,
     // 设置data block index
     rep->index_block = index_block;
     // 设置cache id
+    // 后面可以看一下如何利用这个id在cache中搜索的？
     rep->cache_id = (options.block_cache ? options.block_cache->NewId() : 0);
     // 开始取出meta block
     rep->filter_data = nullptr;
@@ -242,6 +255,10 @@ static void ReleaseBlock(void* arg, void* h) {
 
 // 这里是把一个编码过的BlockHandle指向的data block里面的data(key/value)部分
 // 读出来
+// arg就是一个Table对象
+// index_value就是一个编码过的offset & size
+// 真正的读取操作由ReadBlock底层来完成。
+// 而这个函数主要是操作与Table & Block Cache相关的事情。
 // Convert an index iterator value (i.e., an encoded BlockHandle)
 // into an iterator over the contents of the corresponding block.
 Iterator* Table::BlockReader(void* arg,
