@@ -110,6 +110,7 @@ class Reader {
   // 4. buffer's end 's offset_ 指的就是backing_store_的尾巴的offset
   //    也就是下一次要读backing_store_的开始处。可以想象，应该是32KB对齐的。
   // Offset of the first location past the end of buffer_.
+  // 步长为kBlockSize
   uint64_t end_of_buffer_offset_;
 
   // Extend record types with the following special values

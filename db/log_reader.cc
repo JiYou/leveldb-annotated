@@ -74,6 +74,9 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
 
     switch (record_type) {
       case kFullType:
+        // 如果读出来的type是一个full type
+        // 那么就不应该在一个record中间
+        // 这里就需要报错
         if (in_fragmented_record) {
           // Handle bug in earlier versions of log::Writer where
           // it could emit an empty kFirstType record at the tail end
@@ -83,7 +86,11 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
             ReportCorruption(scratch->size(), "partial record without end(1)");
           }
         }
+        // 由于是一个full record
+        // 所以这里直接清理scratch
         scratch->clear();
+        // 由于fragment是完整的，所以直接赋值，返回之。
+        // 浅拷贝
         *record = fragment;
         // 所以last_record_offset_指向的就是一个record的开头位置
         // 也就是刚读出来的record的开头位置
@@ -91,6 +98,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
         return true;
 
       case kFirstType:
+        // 读到开头的时候，当然也不是说是读到中间了
         if (in_fragmented_record) {
           // Handle bug in earlier versions of log::Writer where
           // it could emit an empty kFirstType record at the tail end
@@ -100,8 +108,11 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
             ReportCorruption(scratch->size(), "partial record without end(2)");
           }
         }
+        // 记录第一个record的开头位置
         k_first_record_offset = physical_record_offset;
+        // 由于是record的开头，直接assign之。
         scratch->assign(fragment.data(), fragment.size());
+        // 还没有遇到结尾，当然是在record的中间了
         in_fragmented_record = true;
         break;
 
@@ -180,6 +191,10 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result) {
     // 会前移，然后buffer_的size就会变化了
     // (场景1): 这里会读取一个block出来
     //         一开始buffer_.size() == 0
+    // NOTE: 如果余下的空间刚好等于kHeaderSize
+    // 这个时候，虽然刚好是7bytes，但是也会存一个有用的record
+    // 比如first,middle,last,之类。
+    // 所以不能跳过
     if (buffer_.size() < kHeaderSize) {
       // 如果还没有遇到尾吧，但是余下的空间是少于kHeaderSize的
       // 那么这里就需要重新取出block size.
@@ -190,6 +205,7 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result) {
         // 然后利用backing_store_构建出
         // buffer_ = Slice(backing_store_, n);
         // n是最终读出来的数据大小
+        // backing_store_相当于caller传进来的一片内存区域
         Status status = file_->Read(kBlockSize, &buffer_, backing_store_);
         end_of_buffer_offset_ += buffer_.size();
         // 这里是读取文件发生错误!
@@ -198,12 +214,15 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result) {
           ReportDrop(kBlockSize, status);
           eof_ = true;
           return kEof;
+
+          // 如果读到遇文件尾巴了
         } else if (buffer_.size() < kBlockSize) {
           eof_ = true;
         }
         // 读完一个block之后，继续
         continue;
       } else {
+        // 文件结束了
         // Note that if buffer_ is non-empty, we have a truncated header at the
         // end of the file, which can be caused by the writer crashing in the
         // middle of writing the header. Instead of considering this an error,

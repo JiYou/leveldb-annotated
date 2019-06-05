@@ -38,13 +38,13 @@ bool HandleDumpCommand(Env* env, char** files, int num) {
 }  // namespace leveldb
 
 static void Usage() {
-  fprintf(
-      stderr,
-      "Usage: leveldbutil command...\n"
-      "   dump files...         -- dump contents of specified files\n"
-      );
+  fprintf(stderr,
+          "Usage: leveldbutil command...\n"
+          "   dump files...         -- dump contents of specified files\n");
 }
 
+// 这个文件里面主要是一些辅助函数。比如可以把sst文件dump出来。把log文件dump出来。
+// 在处理的时候，会根据文件名自动决定文件的类型，然后dump.
 int main(int argc, char** argv) {
   leveldb::Env* env = leveldb::Env::Default();
   bool ok = true;
@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
   } else {
     std::string command = argv[1];
     if (command == "dump") {
-      ok = leveldb::HandleDumpCommand(env, argv+2, argc-2);
+      ok = leveldb::HandleDumpCommand(env, argv + 2, argc - 2);
     } else {
       Usage();
       ok = false;
