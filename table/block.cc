@@ -6,8 +6,8 @@
 
 #include "table/block.h"
 
-#include <vector>
 #include <algorithm>
+#include <vector>
 #include "leveldb/comparator.h"
 #include "table/format.h"
 #include "util/coding.h"
@@ -16,31 +16,34 @@
 namespace leveldb {
 
 inline uint32_t Block::NumRestarts() const {
-  assert(size_ >= sizeof(uint32_t));
-  return DecodeFixed32(data_ + size_ - sizeof(uint32_t));
+    assert(size_ >= sizeof(uint32_t));
+    return DecodeFixed32(data_ + size_ - sizeof(uint32_t));
 }
 
 Block::Block(const BlockContents& contents)
-    : data_(contents.data.data()),
-      size_(contents.data.size()),
-      owned_(contents.heap_allocated) {
-  if (size_ < sizeof(uint32_t)) {
-    size_ = 0;  // Error marker
-  } else {
-    size_t max_restarts_allowed = (size_-sizeof(uint32_t)) / sizeof(uint32_t);
-    if (NumRestarts() > max_restarts_allowed) {
-      // The size is too small for NumRestarts()
-      size_ = 0;
+    : data_(contents.data.data()),       // 数据区域的指针
+      size_(contents.data.size()),       // 数据区域的长度
+      owned_(contents.heap_allocated) {  // 数据内存区域的owner
+    if (size_ < sizeof(uint32_t)) {
+        size_ = 0;  // Error marker
     } else {
-      restart_offset_ = size_ - (1 + NumRestarts()) * sizeof(uint32_t);
+        // 如果整个内存区域都用来存放restarts
+        size_t max_restarts_allowed =
+            (size_ - sizeof(uint32_t)) / sizeof(uint32_t);
+        // 如果总的restart比这个还要多
+        if (NumRestarts() > max_restarts_allowed) {
+            // The size is too small for NumRestarts()
+            size_ = 0;
+        } else {
+            restart_offset_ = size_ - (1 + NumRestarts()) * sizeof(uint32_t);
+        }
     }
-  }
 }
 
 Block::~Block() {
-  if (owned_) {
-    delete[] data_;
-  }
+    if (owned_) {
+        delete[] data_;
+    }
 }
 
 // Helper routine: decode the next block entry starting at "p",
@@ -51,219 +54,279 @@ Block::~Block() {
 // If any errors are detected, returns nullptr.  Otherwise, returns a
 // pointer to the key delta (just past the three decoded values).
 static inline const char* DecodeEntry(const char* p, const char* limit,
-                                      uint32_t* shared,
-                                      uint32_t* non_shared,
+                                      uint32_t* shared, uint32_t* non_shared,
                                       uint32_t* value_length) {
-  if (limit - p < 3) return nullptr;
-  *shared = reinterpret_cast<const unsigned char*>(p)[0];
-  *non_shared = reinterpret_cast<const unsigned char*>(p)[1];
-  *value_length = reinterpret_cast<const unsigned char*>(p)[2];
-  if ((*shared | *non_shared | *value_length) < 128) {
-    // Fast path: all three values are encoded in one byte each
-    p += 3;
-  } else {
-    if ((p = GetVarint32Ptr(p, limit, shared)) == nullptr) return nullptr;
-    if ((p = GetVarint32Ptr(p, limit, non_shared)) == nullptr) return nullptr;
-    if ((p = GetVarint32Ptr(p, limit, value_length)) == nullptr) return nullptr;
-  }
+    if (limit - p < 3) return nullptr;
+    *shared = reinterpret_cast<const unsigned char*>(p)[0];
+    *non_shared = reinterpret_cast<const unsigned char*>(p)[1];
+    *value_length = reinterpret_cast<const unsigned char*>(p)[2];
+    if ((*shared | *non_shared | *value_length) < 128) {
+        // Fast path: all three values are encoded in one byte each
+        p += 3;
+    } else {
+        if ((p = GetVarint32Ptr(p, limit, shared)) == nullptr) return nullptr;
+        if ((p = GetVarint32Ptr(p, limit, non_shared)) == nullptr)
+            return nullptr;
+        if ((p = GetVarint32Ptr(p, limit, value_length)) == nullptr)
+            return nullptr;
+    }
 
-  if (static_cast<uint32_t>(limit - p) < (*non_shared + *value_length)) {
-    return nullptr;
-  }
-  return p;
+    if (static_cast<uint32_t>(limit - p) < (*non_shared + *value_length)) {
+        return nullptr;
+    }
+    return p;
 }
 
 // 重点是看这个Iter
 class Block::Iter : public Iterator {
- private:
-  const Comparator* const comparator_;
-  const char* const data_;      // underlying block contents
-  uint32_t const restarts_;     // Offset of restart array (list of fixed32)
-  uint32_t const num_restarts_; // Number of uint32_t entries in restart array
+   private:
+    const Comparator* const comparator_;
+    // 整个Block所在的内存区域
+    const char* const data_;  // underlying block contents
+    // restarts_在data_里面的偏移，应该是按bytes来算的
+    // 这里命名为restarts_offset_感觉更合理
+    uint32_t const restarts_;  // Offset of restart array (list of fixed32)
+    // 有多少个restarts
+    uint32_t const
+        num_restarts_;  // Number of uint32_t entries in restart array
 
-  // current_ is offset in data_ of current entry.  >= restarts_ if !Valid
-  uint32_t current_;
-  uint32_t restart_index_;  // Index of restart block in which current_ falls
-  std::string key_;
-  Slice value_;
-  Status status_;
+    // current_ is offset in data_ of current entry.  >= restarts_ if !Valid
+    // 在初始化的时候，设置成restarts_offset
+    // 可以命名为current_offset_
+    uint32_t current_;
+    // 当前current所在的restart_的索引
+    // 初始化的时候，设置成最后一个
+    // current_restart_index_
+    uint32_t restart_index_;  // Index of restart block in which current_ falls
+    // 当前所指的完整的key
+    std::string key_;
+    // 当前所指的完整的value
+    Slice value_;
+    Status status_;
 
-  inline int Compare(const Slice& a, const Slice& b) const {
-    return comparator_->Compare(a, b);
-  }
+    inline int Compare(const Slice& a, const Slice& b) const {
+        return comparator_->Compare(a, b);
+    }
 
-  // Return the offset in data_ just past the end of the current entry.
-  inline uint32_t NextEntryOffset() const {
-    return (value_.data() + value_.size()) - data_;
-  }
+    // Return the offset in data_ just past the end of the current entry.
+    inline uint32_t NextEntryOffset() const {
+        // 当前key:value条目的尾巴 = value_.data() + value_.size()
+        // 再减去data_就得到了下一个条目的开头
+        return (value_.data() + value_.size()) - data_;
+    }
 
-  uint32_t GetRestartPoint(uint32_t index) {
-    assert(index < num_restarts_);
-    return DecodeFixed32(data_ + restarts_ + index * sizeof(uint32_t));
-  }
+    // 这里是拿到第index个restart在整个data里面的偏移
+    uint32_t GetRestartPoint(uint32_t index) {
+        assert(index < num_restarts_);
+        // data_ + restarts_ + index *
+        // sizeof(uint32_t)拿到的是restarts_[index]的偏移。
+        // Decode就是取出其中的内容。然后就是restart block在data中的偏移
+        return DecodeFixed32(data_ + restarts_ + index * sizeof(uint32_t));
+    }
 
-  void SeekToRestartPoint(uint32_t index) {
-    key_.clear();
-    restart_index_ = index;
-    // current_ will be fixed by ParseNextKey();
+    void SeekToRestartPoint(uint32_t index) {
+        key_.clear();
+        restart_index_ = index;
+        // 这里并不去更新current_是有原因的。
+        // 是因为后面去调用ParseNextKey()的时候，会去value那里拿到key
+        // 由于是restart的头开，也不用去担心key是否完整的问题。
+        // current_ will be fixed by ParseNextKey();
 
-    // ParseNextKey() starts at the end of value_, so set value_ accordingly
-    uint32_t offset = GetRestartPoint(index);
-    value_ = Slice(data_ + offset, 0);
-  }
+        // 由于key依赖于value,所以这里直接去更新value.
+        // ParseNextKey() starts at the end of value_, so set value_ accordingly
+        // 有趣的是，这里直接把value的长度设置为0
+        uint32_t offset = GetRestartPoint(index);
+        // NextEntryOffset()就直接可以拿到key的头了
+        value_ = Slice(data_ + offset, 0);
+    }
 
- public:
-  Iter(const Comparator* comparator,
-       const char* data,
-       uint32_t restarts,
-       uint32_t num_restarts)
-      : comparator_(comparator),
-        data_(data),
-        restarts_(restarts),
-        num_restarts_(num_restarts),
-        current_(restarts_),
-        restart_index_(num_restarts_) {
-    assert(num_restarts_ > 0);
-  }
+   public:
+    Iter(const Comparator* comparator, const char* data, uint32_t restarts,
+         uint32_t num_restarts)
+        : comparator_(comparator),
+          data_(data),                  // 内存区域
+          restarts_(restarts),          // restarts_offset_
+          num_restarts_(num_restarts),  // restarts的数目
+          // current key:val 所在的offset,
+          // 一开始指向restarts开头，也就是key:value的底部表示无效的iterator.
+          current_(restarts_),
+          // current所在的restart index
+          restart_index_(num_restarts_) {
+        assert(num_restarts_ > 0);
+    }
 
-  virtual bool Valid() const { return current_ < restarts_; }
-  virtual Status status() const { return status_; }
-  virtual Slice key() const {
-    assert(Valid());
-    return key_;
-  }
-  virtual Slice value() const {
-    assert(Valid());
-    return value_;
-  }
+    // 查看是否有效。一开始iterator都是无效的。
+    // current_ key:val所在的offset都是指向key:val的底部，也就是restarts_
+    virtual bool Valid() const { return current_ < restarts_; }
+    // 返回状态
+    // status指的不是当前是否valid，而是在操作的过程中是否发生了某种错误。比如
+    // 数据不一致什么的。
+    virtual Status status() const { return status_; }
+    // 返回当前iterator的key
+    virtual Slice key() const {
+        assert(Valid());
+        return key_;
+    }
+    // 返回当前的value
+    virtual Slice value() const {
+        assert(Valid());
+        return value_;
+    }
 
-  virtual void Next() {
-    assert(Valid());
-    ParseNextKey();
-  }
+    // 提取下一个key.
+    virtual void Next() {
+        // 需要在有效的情况下才可以移动
+        assert(Valid());
+        ParseNextKey();
+    }
 
-  virtual void Prev() {
-    assert(Valid());
+    virtual void Prev() {
+        assert(Valid());
 
-    // Scan backwards to a restart point before current_
-    const uint32_t original = current_;
-    while (GetRestartPoint(restart_index_) >= original) {
-      if (restart_index_ == 0) {
-        // No more entries
+        // Scan backwards to a restart point before current_
+        // 拿到当前key:val所在的offset
+        const uint32_t original = current_;
+        // 这里拿到当前current所在restart下标所在的offset
+        // Data Block的开头位置如果比original大。
+        // 这样存在的原因是因为，可以调用SeekToRestartPoint
+        // 在SeekToRestartPoint()这里面更改了restart_index_
+        // 但是没有更改current_
+        // 所以如果存在移动到了内存地址更大的地方，那么就需要调整restart_index_
+        // GetRestartPoint == GetRestartIndexOffsetInData()
+        // TODO: 实际上，这里有可能是可以改成二分搜索的
+        while (GetRestartPoint(restart_index_) >= original) {
+            // 如果已经是0了
+            // 并且还比original大，或者相等
+            // 那么此时的prev就是无效的了。
+            // 直接设置成无效的!
+            if (restart_index_ == 0) {
+                // No more entries
+                current_ = restarts_;
+                restart_index_ = num_restarts_;
+                return;
+            }
+            // 向前移动
+            restart_index_--;
+        }
+        // 到这里，已经求得original原本所在的restart_index
+        // 这里修改了key & value & restart_index_
+        SeekToRestartPoint(restart_index_);
+        // 由于移动到了一个restart的开头，那么这里一步一步向后，直到移动到了original前面。
+        // 注意是用NextEntryOffset() < original来判断的
+        do {
+            // Loop until end of current entry hits the start of original entry
+        } while (ParseNextKey() && NextEntryOffset() < original);
+        // 退出的时候，肯定NextEntryOffset() == original;
+    }
+
+    // 这里实际上就是在用二分法找到刚好比target小的那个key:val
+    virtual void Seek(const Slice& target) {
+        // Binary search in restart array to find the last restart point
+        // with a key < target
+        uint32_t left = 0;
+        uint32_t right = num_restarts_ - 1;
+        while (left < right) {
+            uint32_t mid = (left + right + 1) / 2;
+            uint32_t region_offset = GetRestartPoint(mid);
+            uint32_t shared, non_shared, value_length;
+            const char* key_ptr =
+                DecodeEntry(data_ + region_offset, data_ + restarts_, &shared,
+                            &non_shared, &value_length);
+            if (key_ptr == nullptr || (shared != 0)) {
+                CorruptionError();
+                return;
+            }
+            Slice mid_key(key_ptr, non_shared);
+            if (Compare(mid_key, target) < 0) {
+                // Key at "mid" is smaller than "target".  Therefore all
+                // blocks before "mid" are uninteresting.
+                left = mid;
+            } else {
+                // Key at "mid" is >= "target".  Therefore all blocks at or
+                // after "mid" are uninteresting.
+                right = mid - 1;
+            }
+        }
+
+        // Linear search (within restart block) for first key >= target
+        // TODO:
+        // 这里效率有待提高，实际上可以直接利用二分找到刚好比target小的地方。
+        // 这里移动到了比target小的restart_index，然后移动到了开头
+        SeekToRestartPoint(left);
+        // 一步一步向后移动，直到找到那个key
+        while (true) {
+            if (!ParseNextKey()) {
+                return;
+            }
+            if (Compare(key_, target) >= 0) {
+                return;
+            }
+        }
+    }
+
+    virtual void SeekToFirst() {
+        SeekToRestartPoint(0);
+        ParseNextKey();
+    }
+
+    virtual void SeekToLast() {
+        SeekToRestartPoint(num_restarts_ - 1);
+        while (ParseNextKey() && NextEntryOffset() < restarts_) {
+            // Keep skipping
+        }
+    }
+
+   private:
+    void CorruptionError() {
         current_ = restarts_;
         restart_index_ = num_restarts_;
-        return;
-      }
-      restart_index_--;
+        status_ = Status::Corruption("bad entry in block");
+        key_.clear();
+        value_.clear();
     }
 
-    SeekToRestartPoint(restart_index_);
-    do {
-      // Loop until end of current entry hits the start of original entry
-    } while (ParseNextKey() && NextEntryOffset() < original);
-  }
+    bool ParseNextKey() {
+        current_ = NextEntryOffset();
+        const char* p = data_ + current_;
+        const char* limit =
+            data_ + restarts_;  // Restarts come right after data
+        if (p >= limit) {
+            // No more entries to return.  Mark as invalid.
+            current_ = restarts_;
+            restart_index_ = num_restarts_;
+            return false;
+        }
 
-  virtual void Seek(const Slice& target) {
-    // Binary search in restart array to find the last restart point
-    // with a key < target
-    uint32_t left = 0;
-    uint32_t right = num_restarts_ - 1;
-    while (left < right) {
-      uint32_t mid = (left + right + 1) / 2;
-      uint32_t region_offset = GetRestartPoint(mid);
-      uint32_t shared, non_shared, value_length;
-      const char* key_ptr = DecodeEntry(data_ + region_offset,
-                                        data_ + restarts_,
-                                        &shared, &non_shared, &value_length);
-      if (key_ptr == nullptr || (shared != 0)) {
-        CorruptionError();
-        return;
-      }
-      Slice mid_key(key_ptr, non_shared);
-      if (Compare(mid_key, target) < 0) {
-        // Key at "mid" is smaller than "target".  Therefore all
-        // blocks before "mid" are uninteresting.
-        left = mid;
-      } else {
-        // Key at "mid" is >= "target".  Therefore all blocks at or
-        // after "mid" are uninteresting.
-        right = mid - 1;
-      }
+        // Decode next entry
+        uint32_t shared, non_shared, value_length;
+        p = DecodeEntry(p, limit, &shared, &non_shared, &value_length);
+        if (p == nullptr || key_.size() < shared) {
+            CorruptionError();
+            return false;
+        } else {
+            key_.resize(shared);
+            key_.append(p, non_shared);
+            value_ = Slice(p + non_shared, value_length);
+            while (restart_index_ + 1 < num_restarts_ &&
+                   GetRestartPoint(restart_index_ + 1) < current_) {
+                ++restart_index_;
+            }
+            return true;
+        }
     }
-
-    // Linear search (within restart block) for first key >= target
-    SeekToRestartPoint(left);
-    while (true) {
-      if (!ParseNextKey()) {
-        return;
-      }
-      if (Compare(key_, target) >= 0) {
-        return;
-      }
-    }
-  }
-
-  virtual void SeekToFirst() {
-    SeekToRestartPoint(0);
-    ParseNextKey();
-  }
-
-  virtual void SeekToLast() {
-    SeekToRestartPoint(num_restarts_ - 1);
-    while (ParseNextKey() && NextEntryOffset() < restarts_) {
-      // Keep skipping
-    }
-  }
-
- private:
-  void CorruptionError() {
-    current_ = restarts_;
-    restart_index_ = num_restarts_;
-    status_ = Status::Corruption("bad entry in block");
-    key_.clear();
-    value_.clear();
-  }
-
-  bool ParseNextKey() {
-    current_ = NextEntryOffset();
-    const char* p = data_ + current_;
-    const char* limit = data_ + restarts_;  // Restarts come right after data
-    if (p >= limit) {
-      // No more entries to return.  Mark as invalid.
-      current_ = restarts_;
-      restart_index_ = num_restarts_;
-      return false;
-    }
-
-    // Decode next entry
-    uint32_t shared, non_shared, value_length;
-    p = DecodeEntry(p, limit, &shared, &non_shared, &value_length);
-    if (p == nullptr || key_.size() < shared) {
-      CorruptionError();
-      return false;
-    } else {
-      key_.resize(shared);
-      key_.append(p, non_shared);
-      value_ = Slice(p + non_shared, value_length);
-      while (restart_index_ + 1 < num_restarts_ &&
-             GetRestartPoint(restart_index_ + 1) < current_) {
-        ++restart_index_;
-      }
-      return true;
-    }
-  }
 };
 
 Iterator* Block::NewIterator(const Comparator* cmp) {
-  if (size_ < sizeof(uint32_t)) {
-    return NewErrorIterator(Status::Corruption("bad block contents"));
-  }
-  const uint32_t num_restarts = NumRestarts();
-  if (num_restarts == 0) {
-    return NewEmptyIterator();
-  } else {
-    return new Iter(cmp, data_, restart_offset_, num_restarts);
-  }
+    // 如果data的长度连一个size都做不到。那么肯定是无效的。
+    if (size_ < sizeof(uint32_t)) {
+        return NewErrorIterator(Status::Corruption("bad block contents"));
+    }
+    const uint32_t num_restarts = NumRestarts();
+    if (num_restarts == 0) {
+        return NewEmptyIterator();
+    } else {
+        return new Iter(cmp, data_, restart_offset_, num_restarts);
+    }
 }
 
 }  // namespace leveldb
